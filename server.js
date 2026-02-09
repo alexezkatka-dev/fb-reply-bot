@@ -1,3 +1,5 @@
+console.log("SERVER VERSION 2024-02-09 WEBHOOK DEBUG");
+
 const express = require("express");
 const fetch = require("node-fetch");
 
