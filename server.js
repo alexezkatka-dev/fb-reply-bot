@@ -12,18 +12,34 @@ const GRAPH_API_BASE = `https://graph.facebook.com/${GRAPH_API_VERSION}`;
 const MAX_PROCESSED = 5000;
 const processedComments = new Map();
 
+// очередь: храним задачи с временем, когда их разрешено выполнять
 const replyQueue = [];
 let processingQueue = false;
-let lastReplyAt = 0;
 
-const MIN_REPLY_INTERVAL_MS = Number(process.env.MIN_REPLY_INTERVAL_MS || 3000);
+// глобальная защита “между ответами”
+let nextReplyAllowedAt = 0;
+
 const MAX_QUEUE_LENGTH = Number(process.env.MAX_QUEUE_LENGTH || 20);
+
+const FIRST_REPLY_MIN_MS = Number(process.env.FIRST_REPLY_MIN_MS || 20000);
+const FIRST_REPLY_MAX_MS = Number(process.env.FIRST_REPLY_MAX_MS || 30000);
+
+const BETWEEN_REPLY_MIN_MS = Number(process.env.BETWEEN_REPLY_MIN_MS || 15000);
+const BETWEEN_REPLY_MAX_MS = Number(process.env.BETWEEN_REPLY_MAX_MS || 45000);
 
 const inflight = new Set();
 
 const isBotEnabled = () => String(process.env.BOT_ENABLED || "").trim() === "1";
 // По умолчанию 1. Выключение: REPLY_TO_REPLIES=0
 const replyToRepliesEnabled = () => String(process.env.REPLY_TO_REPLIES || "1").trim() === "1";
+
+const randInt = (min, max) => {
+  const a = Number(min);
+  const b = Number(max);
+  const lo = Math.min(a, b);
+  const hi = Math.max(a, b);
+  return Math.floor(lo + Math.random() * (hi - lo + 1));
+};
 
 const rememberComment = (id) => {
   processedComments.set(id, Date.now());
@@ -223,6 +239,20 @@ const resolvePageIdOnce = async (pageToken) => {
   }
 };
 
+// берём задачу с самым ранним dueAt
+const getNextTaskIndex = () => {
+  let bestIdx = -1;
+  let bestDue = Infinity;
+  for (let i = 0; i < replyQueue.length; i++) {
+    const dueAt = Number(replyQueue[i]?.dueAt || 0);
+    if (dueAt < bestDue) {
+      bestDue = dueAt;
+      bestIdx = i;
+    }
+  }
+  return bestIdx;
+};
+
 const scheduleQueueProcessing = () => {
   if (processingQueue) return;
   processingQueue = true;
@@ -240,19 +270,42 @@ const scheduleQueueProcessing = () => {
       return;
     }
 
+    const idx = getNextTaskIndex();
+    if (idx < 0) {
+      processingQueue = false;
+      return;
+    }
+
+    const taskObj = replyQueue[idx];
     const now = Date.now();
-    const waitMs = Math.max(0, MIN_REPLY_INTERVAL_MS - (now - lastReplyAt));
+
+    const dueAt = Number(taskObj.dueAt || 0);
+    const waitForDue = Math.max(0, dueAt - now);
+
+    const waitForGlobal = Math.max(0, nextReplyAllowedAt - now);
+
+    const waitMs = Math.max(waitForDue, waitForGlobal);
+
     if (waitMs > 0) {
       setTimeout(runNext, waitMs);
       return;
     }
 
-    const task = replyQueue.shift();
+    // вынимаем выбранную задачу
+    replyQueue.splice(idx, 1);
+
     try {
-      const replied = await task();
-      if (replied) lastReplyAt = Date.now();
+      const replied = await taskObj.run();
+      if (replied) {
+        // после успешного ответа ставим следующую “человеческую” паузу
+        const gap = randInt(BETWEEN_REPLY_MIN_MS, BETWEEN_REPLY_MAX_MS);
+        nextReplyAllowedAt = Date.now() + gap;
+      }
     } catch (err) {
       console.error("QUEUE_TASK_ERROR", err);
+      // если упало, тоже ставим паузу, чтобы не стрелять сразу дальше
+      const gap = randInt(BETWEEN_REPLY_MIN_MS, BETWEEN_REPLY_MAX_MS);
+      nextReplyAllowedAt = Date.now() + gap;
     } finally {
       setImmediate(runNext);
     }
@@ -336,44 +389,58 @@ app.post("/webhook", (req, res) => {
 
           inflight.add(commentId);
 
-          replyQueue.push(async () => {
-            try {
-              if (!isBotEnabled()) {
-                console.log("BOT_DISABLED_DROP", commentId);
-                return false;
-              }
+          // задержка перед первым ответом на этот коммент
+          const firstDelay = randInt(FIRST_REPLY_MIN_MS, FIRST_REPLY_MAX_MS);
+          const dueAt = Date.now() + firstDelay;
 
-              if (wasProcessed(commentId)) {
-                console.log("SKIP_DUPLICATE_LATE", commentId);
-                return false;
-              }
+          replyQueue.push({
+            commentId,
+            dueAt,
+            run: async () => {
+              try {
+                if (!isBotEnabled()) {
+                  console.log("BOT_DISABLED_DROP", commentId);
+                  return false;
+                }
 
-              const comment = await fetchComment(commentId, pageToken);
+                if (wasProcessed(commentId)) {
+                  console.log("SKIP_DUPLICATE_LATE", commentId);
+                  return false;
+                }
 
-              if (pageId && String(comment?.from?.id || "") === pageId) {
+                const comment = await fetchComment(commentId, pageToken);
+
+                if (pageId && String(comment?.from?.id || "") === pageId) {
+                  rememberComment(commentId);
+                  console.log("SKIP_SELF", commentId);
+                  return false;
+                }
+
+                if (isNoiseOnly(comment?.message)) {
+                  rememberComment(commentId);
+                  console.log("SKIP_NOISE", commentId);
+                  return false;
+                }
+
+                const reply = await generateReply(comment);
+                const posted = await postReply(commentId, reply, pageToken);
+
                 rememberComment(commentId);
-                console.log("SKIP_SELF", commentId);
-                return false;
+
+                const postedId = pickId(posted);
+                if (postedId) rememberComment(postedId);
+
+                console.log(
+                  "REPLIED",
+                  comment?.permalink_url || commentId,
+                  "firstDelayMs=" + firstDelay,
+                  reply,
+                  postedId
+                );
+                return true;
+              } finally {
+                inflight.delete(commentId);
               }
-
-              if (isNoiseOnly(comment?.message)) {
-                rememberComment(commentId);
-                console.log("SKIP_NOISE", commentId);
-                return false;
-              }
-
-              const reply = await generateReply(comment);
-              const posted = await postReply(commentId, reply, pageToken);
-
-              rememberComment(commentId);
-
-              const postedId = pickId(posted);
-              if (postedId) rememberComment(postedId);
-
-              console.log("REPLIED", comment?.permalink_url || commentId, reply, postedId);
-              return true;
-            } finally {
-              inflight.delete(commentId);
             }
           });
 
