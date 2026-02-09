@@ -11,6 +11,11 @@ const GRAPH_API_BASE = `https://graph.facebook.com/${GRAPH_API_VERSION}`;
 
 const MAX_PROCESSED = 5000;
 const processedComments = new Map();
+const replyQueue = [];
+let processingQueue = false;
+let lastReplyAt = 0;
+const MIN_REPLY_INTERVAL_MS = 3000;
+const MAX_QUEUE_LENGTH = 20;
 
 const rememberComment = (id) => {
   processedComments.set(id, Date.now());
@@ -68,6 +73,9 @@ const buildPrompt = (comment) => {
     "No hashtags. Do not mention AI, bots, or policies.",
     "End with EXACTLY ONE specific question that encourages a reply.",
     "Prefer choice questions, experience questions, or quick clarifications.",
+    "If the user asked a question, answer briefly and ask a clarifying question.",
+    "If they say they will try it or thank you, ask about results or timing.",
+    "If they express doubt, ask what seems off or which version they use.",
     "",
     `User comment: "${text}"`
   ].join("\n");
@@ -151,6 +159,39 @@ const postReply = async (commentId, text, pageToken) => {
   return r.json();
 };
 
+const scheduleQueueProcessing = () => {
+  if (processingQueue) return;
+  processingQueue = true;
+
+  const runNext = async () => {
+    if (!replyQueue.length) {
+      processingQueue = false;
+      return;
+    }
+
+    const now = Date.now();
+    const waitMs = Math.max(0, MIN_REPLY_INTERVAL_MS - (now - lastReplyAt));
+    if (waitMs > 0) {
+      setTimeout(runNext, waitMs);
+      return;
+    }
+
+    const task = replyQueue.shift();
+    try {
+      const replied = await task();
+      if (replied) {
+        lastReplyAt = Date.now();
+      }
+    } catch (err) {
+      console.error("QUEUE_TASK_ERROR", err);
+    } finally {
+      setImmediate(runNext);
+    }
+  };
+
+  setImmediate(runNext);
+};
+
 app.get("/webhook", (req, res) => {
   const mode = req.query["hub.mode"];
   const token = req.query["hub.verify_token"];
@@ -186,9 +227,14 @@ app.post("/webhook", (req, res) => {
   console.log("WEBHOOK IN", new Date().toISOString());
   res.sendStatus(200);
 
-  // Process asynchronously without any artificial delay.
   setImmediate(async () => {
     try {
+      const botEnabled = String(process.env.BOT_ENABLED || "").trim() === "1";
+      if (!botEnabled) {
+        console.log("BOT_DISABLED");
+        return;
+      }
+
       const entries = Array.isArray(req.body?.entry) ? req.body.entry : [];
       if (!entries.length) return;
 
@@ -208,6 +254,7 @@ app.post("/webhook", (req, res) => {
           }
 
           if (c?.field !== "feed" || value?.item !== "comment" || value?.verb !== "add") {
+            console.log("SKIP_EVENT", c?.field, value?.item, value?.verb);
             continue;
           }
 
@@ -217,31 +264,42 @@ app.post("/webhook", (req, res) => {
             continue;
           }
 
-          const comment = await fetchComment(commentId, pageToken);
-
-          if (pageId && String(comment?.from?.id || "") === pageId) {
+          if (replyQueue.length >= MAX_QUEUE_LENGTH) {
             rememberComment(commentId);
-            console.log("SKIP_SELF", commentId);
+            console.log("RATE_LIMIT_SKIP", commentId);
             continue;
           }
 
-          if (isReplyToPage(comment, pageId)) {
+          replyQueue.push(async () => {
+            const comment = await fetchComment(commentId, pageToken);
+
+            if (pageId && String(comment?.from?.id || "") === pageId) {
+              rememberComment(commentId);
+              console.log("SKIP_SELF", commentId);
+              return false;
+            }
+
+            if (isReplyToPage(comment, pageId)) {
+              rememberComment(commentId);
+              console.log("SKIP_REPLY_TO_PAGE", commentId);
+              return false;
+            }
+
+            if (isLikelyBotOrMetaComment(comment?.message)) {
+              rememberComment(commentId);
+              console.log("SKIP_NOISE", commentId);
+              return false;
+            }
+
+            const reply = await generateReply(comment);
+            await postReply(commentId, reply, pageToken);
             rememberComment(commentId);
-            console.log("SKIP_REPLY_TO_PAGE", commentId);
-            continue;
-          }
 
-          if (isLikelyBotOrMetaComment(comment?.message)) {
-            rememberComment(commentId);
-            console.log("SKIP_NOISE", commentId);
-            continue;
-          }
+            console.log("REPLIED", comment?.permalink_url || commentId, reply);
+            return true;
+          });
 
-          const reply = await generateReply(comment);
-          await postReply(commentId, reply, pageToken);
-          rememberComment(commentId);
-
-          console.log("REPLIED", comment?.permalink_url || commentId);
+          scheduleQueueProcessing();
         }
       }
     } catch (err) {
