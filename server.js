@@ -21,6 +21,20 @@ const rememberComment = (commentId) => {
 
 const wasProcessed = (commentId) => processedComments.has(commentId);
 
+const normalize = (s) =>
+  String(s || "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+const isLikelyBotOrMetaComment = (msg) => {
+  const m = normalize(msg).toLowerCase();
+  if (!m) return true;
+  // Отсекаем служебный мусор и "пустые" комменты
+  if (m.length < 2) return true;
+  if (/^(\.|!|\?|:|,)+$/.test(m)) return true;
+  return false;
+};
+
 const fetchComment = async (commentId, pageToken) => {
   const url = new URL(`${GRAPH_API_BASE}/${commentId}`);
   url.searchParams.set("fields", "message,from,permalink_url");
@@ -34,14 +48,26 @@ const fetchComment = async (commentId, pageToken) => {
   return response.json();
 };
 
+// 1) ЖЁСТКО английский
+// 2) 1-2 предложения
+// 3) ОДИН вопрос в конце, чтобы тянуть ветку
+// 4) Без упоминания AI/ботов, без хештегов
+// 5) Вопросы, которые запускают диалог: выбор, опыт, уточнение
 const buildPrompt = (comment) => {
-  const message = comment?.message || "";
+  const message = normalize(comment?.message);
+
   return [
-    "Ты дружелюбный админ страницы T.Lifehack USA.",
-    "Ответь на комментарий коротко, 1-2 предложения, живо и по делу.",
-    "Если уместно, задай один вопрос в конце.",
+    "You are the friendly admin of the Facebook page T.Lifehack USA.",
+    "Reply ONLY in English.",
+    "Goal: make the user leave a follow-up comment.",
+    "Write 1 to 2 short sentences.",
+    "End with EXACTLY ONE specific question.",
+    "Be warm, helpful, and natural.",
+    "Do not mention AI, bots, rules, or policies.",
+    "Do not use hashtags.",
+    "Avoid long explanations.",
     "",
-    `Комментарий: "${message}"`
+    `User comment: "${message}"`
   ].join("\n");
 };
 
@@ -125,14 +151,10 @@ const extractCommentIdFromChangeValue = (value) => {
   if (typeof value.comment_id === "string") return value.comment_id;
   if (value.comment && typeof value.comment.id === "string") return value.comment.id;
   if (typeof value.commentId === "string") return value.commentId;
-  if (typeof value.post_id === "string" && value.item === "comment" && typeof value.parent_id === "string") {
-    return "";
-  }
   return "";
 };
 
 app.post("/webhook", (req, res) => {
-  // Всегда логируем вход. Без условий.
   console.log("WEBHOOK IN", new Date().toISOString(), {
     method: req.method,
     path: req.path,
@@ -141,15 +163,12 @@ app.post("/webhook", (req, res) => {
     bodyKeys: req.body ? Object.keys(req.body) : []
   });
 
-  // Всегда быстро отвечаем 200, чтобы Meta не считала доставку проваленной.
   res.sendStatus(200);
 
-  // Дальше обработка асинхронно.
   setImmediate(async () => {
     try {
       const body = req.body || {};
 
-      // Тестовые события и любые события без entry просто логируем.
       const entries = Array.isArray(body.entry) ? body.entry : [];
       if (!entries.length) {
         console.log("WEBHOOK SKIP: no entry", JSON.stringify(body).slice(0, 2000));
@@ -159,10 +178,13 @@ app.post("/webhook", (req, res) => {
       const pageToken = process.env.FB_PAGE_TOKEN;
       if (!pageToken) throw new Error("FB_PAGE_TOKEN is not set");
 
+      const pageId = String(process.env.PAGE_ID || "").trim();
+      // Рекомендуется выставить PAGE_ID в Render ENV
+      // PAGE_ID=102508869198983
+
       for (const entry of entries) {
         const changes = Array.isArray(entry?.changes) ? entry.changes : [];
 
-        // Иногда прилетают не changes, а другие форматы. Логируем и идём дальше.
         if (!changes.length) {
           console.log("WEBHOOK ENTRY WITHOUT CHANGES", JSON.stringify(entry).slice(0, 2000));
           continue;
@@ -172,17 +194,30 @@ app.post("/webhook", (req, res) => {
           const field = change?.field;
           const value = change?.value;
 
-          // Логируем любой field, чтобы видеть реальность.
           console.log("WEBHOOK CHANGE", { field, item: value?.item, verb: value?.verb });
 
+          // Обрабатываем только комменты
           const commentId = extractCommentIdFromChangeValue(value);
-
-          // Тестовый feed status и любые события без comment_id пропускаем.
           if (!commentId) continue;
 
           if (wasProcessed(commentId)) continue;
 
           const comment = await fetchComment(commentId, pageToken);
+
+          // 1) НЕ отвечать самому себе
+          if (pageId && String(comment?.from?.id || "") === pageId) {
+            console.log("SKIP: self comment", { commentId });
+            rememberComment(commentId);
+            continue;
+          }
+
+          // 2) НЕ отвечать на мусор/пустые комменты
+          if (isLikelyBotOrMetaComment(comment?.message)) {
+            console.log("SKIP: empty/low-signal", { commentId });
+            rememberComment(commentId);
+            continue;
+          }
+
           const replyText = await generateReply(comment);
           await postReply(commentId, replyText, pageToken);
           rememberComment(commentId);
@@ -202,4 +237,3 @@ app.get("/", (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server started on ${PORT}`));
-
