@@ -27,11 +27,27 @@ const FIRST_REPLY_MAX_MS = Number(process.env.FIRST_REPLY_MAX_MS || 30000);
 const BETWEEN_REPLY_MIN_MS = Number(process.env.BETWEEN_REPLY_MIN_MS || 15000);
 const BETWEEN_REPLY_MAX_MS = Number(process.env.BETWEEN_REPLY_MAX_MS || 45000);
 
+// лимиты и вероятности
+const MAX_REPLIES_PER_HOUR = Number(process.env.MAX_REPLIES_PER_HOUR || 40);
+const MAX_REPLIES_PER_DAY = Number(process.env.MAX_REPLIES_PER_DAY || 300);
+const MAX_BOT_REPLIES_PER_THREAD = Number(process.env.MAX_BOT_REPLIES_PER_THREAD || 3);
+
+const REPLY_PROB_TOP = Number(process.env.REPLY_PROB_TOP || 0.9);
+const REPLY_PROB_REPLY = Number(process.env.REPLY_PROB_REPLY || 0.7);
+
+const IGNORE_OLD_COMMENTS_MIN = Number(process.env.IGNORE_OLD_COMMENTS_MIN || 5);
+
+const replyHour = [];
+const replyDay = [];
+const threadReplies = new Map();
+
 const inflight = new Set();
 
 const isBotEnabled = () => String(process.env.BOT_ENABLED || "").trim() === "1";
 // По умолчанию 1. Выключение: REPLY_TO_REPLIES=0
 const replyToRepliesEnabled = () => String(process.env.REPLY_TO_REPLIES || "1").trim() === "1";
+
+const nowMs = () => Date.now();
 
 const randInt = (min, max) => {
   const a = Number(min);
@@ -39,6 +55,50 @@ const randInt = (min, max) => {
   const lo = Math.min(a, b);
   const hi = Math.max(a, b);
   return Math.floor(lo + Math.random() * (hi - lo + 1));
+};
+
+const prune = (arr, windowMs) => {
+  const cutoff = nowMs() - windowMs;
+  while (arr.length && arr[0] < cutoff) arr.shift();
+};
+
+const canReplyByRate = () => {
+  prune(replyHour, 60 * 60 * 1000);
+  prune(replyDay, 24 * 60 * 60 * 1000);
+  return replyHour.length < MAX_REPLIES_PER_HOUR && replyDay.length < MAX_REPLIES_PER_DAY;
+};
+
+const markReply = () => {
+  const t = nowMs();
+  replyHour.push(t);
+  replyDay.push(t);
+};
+
+const pruneThreadReplies = () => {
+  const cutoff = nowMs() - 48 * 60 * 60 * 1000;
+  for (const [k, v] of threadReplies.entries()) {
+    if (!v || v.ts < cutoff) threadReplies.delete(k);
+  }
+};
+
+const getThreadKey = (value, commentId) => {
+  const parentId = String(value?.parent_id || "");
+  const postId = String(value?.post_id || "");
+  if (parentId && postId && parentId !== postId) return parentId;
+  return commentId;
+};
+
+const canReplyInThread = (threadKey) => {
+  pruneThreadReplies();
+  const cur = threadReplies.get(threadKey);
+  const count = Number(cur?.count || 0);
+  return count < MAX_BOT_REPLIES_PER_THREAD;
+};
+
+const markThreadReply = (threadKey) => {
+  const cur = threadReplies.get(threadKey);
+  const count = Number(cur?.count || 0) + 1;
+  threadReplies.set(threadKey, { count, ts: nowMs() });
 };
 
 const rememberComment = (id) => {
@@ -62,6 +122,11 @@ const isNoiseOnly = (msg) => {
 
   if (/^(?:[\p{P}\p{S}\p{Z}]+)$/u.test(m)) return true;
   if (/^(?:[\p{Z}\p{Emoji_Presentation}\p{Extended_Pictographic}]+)$/u.test(m)) return true;
+
+  const low = m.toLowerCase();
+  const words = low.split(/\s+/).filter(Boolean);
+  const fillers = new Set(["ok", "okay", "nice", "wow", "cool", "lol", "thanks", "thx", "great", "good"]);
+  if (words.length === 1 && fillers.has(words[0])) return true;
 
   return false;
 };
@@ -291,19 +356,16 @@ const scheduleQueueProcessing = () => {
       return;
     }
 
-    // вынимаем выбранную задачу
     replyQueue.splice(idx, 1);
 
     try {
       const replied = await taskObj.run();
       if (replied) {
-        // после успешного ответа ставим следующую “человеческую” паузу
         const gap = randInt(BETWEEN_REPLY_MIN_MS, BETWEEN_REPLY_MAX_MS);
         nextReplyAllowedAt = Date.now() + gap;
       }
     } catch (err) {
       console.error("QUEUE_TASK_ERROR", err);
-      // если упало, тоже ставим паузу, чтобы не стрелять сразу дальше
       const gap = randInt(BETWEEN_REPLY_MIN_MS, BETWEEN_REPLY_MAX_MS);
       nextReplyAllowedAt = Date.now() + gap;
     } finally {
@@ -381,6 +443,41 @@ app.post("/webhook", (req, res) => {
             continue;
           }
 
+          // игнор старых, чтобы после рестарта не трогать прошлое
+          const createdSec = Number(value?.created_time || 0);
+          if (createdSec) {
+            const createdMs = createdSec * 1000;
+            if (nowMs() - createdMs > IGNORE_OLD_COMMENTS_MIN * 60 * 1000) {
+              rememberComment(commentId);
+              console.log("SKIP_OLD_COMMENT", commentId);
+              continue;
+            }
+          }
+
+          // вероятность ответа
+          const isReply = isReplyEvent(value);
+          const prob = isReply ? REPLY_PROB_REPLY : REPLY_PROB_TOP;
+          if (Math.random() > prob) {
+            rememberComment(commentId);
+            console.log("SKIP_PROBABILITY", commentId);
+            continue;
+          }
+
+          // лимит по времени
+          if (!canReplyByRate()) {
+            rememberComment(commentId);
+            console.log("SKIP_RATE_LIMIT", commentId);
+            continue;
+          }
+
+          // лимит на ветку
+          const threadKey = getThreadKey(value, commentId);
+          if (!canReplyInThread(threadKey)) {
+            rememberComment(commentId);
+            console.log("SKIP_THREAD_LIMIT", commentId);
+            continue;
+          }
+
           if (replyQueue.length >= MAX_QUEUE_LENGTH) {
             rememberComment(commentId);
             console.log("RATE_LIMIT_SKIP", commentId);
@@ -389,7 +486,6 @@ app.post("/webhook", (req, res) => {
 
           inflight.add(commentId);
 
-          // задержка перед первым ответом на этот коммент
           const firstDelay = randInt(FIRST_REPLY_MIN_MS, FIRST_REPLY_MAX_MS);
           const dueAt = Date.now() + firstDelay;
 
@@ -430,9 +526,13 @@ app.post("/webhook", (req, res) => {
                 const postedId = pickId(posted);
                 if (postedId) rememberComment(postedId);
 
+                markReply();
+                markThreadReply(threadKey);
+
                 console.log(
                   "REPLIED",
                   comment?.permalink_url || commentId,
+                  "thread=" + threadKey,
                   "firstDelayMs=" + firstDelay,
                   reply,
                   postedId
