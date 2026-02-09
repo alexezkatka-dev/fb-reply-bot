@@ -11,11 +11,19 @@ const GRAPH_API_BASE = `https://graph.facebook.com/${GRAPH_API_VERSION}`;
 
 const MAX_PROCESSED = 5000;
 const processedComments = new Map();
+
 const replyQueue = [];
 let processingQueue = false;
 let lastReplyAt = 0;
-const MIN_REPLY_INTERVAL_MS = 3000;
-const MAX_QUEUE_LENGTH = 20;
+
+const MIN_REPLY_INTERVAL_MS = Number(process.env.MIN_REPLY_INTERVAL_MS || 3000);
+const MAX_QUEUE_LENGTH = Number(process.env.MAX_QUEUE_LENGTH || 20);
+
+const inflight = new Set();
+
+const isBotEnabled = () => String(process.env.BOT_ENABLED || "").trim() === "1";
+// По умолчанию 1. Выключение: REPLY_TO_REPLIES=0
+const replyToRepliesEnabled = () => String(process.env.REPLY_TO_REPLIES || "1").trim() === "1";
 
 const rememberComment = (id) => {
   processedComments.set(id, Date.now());
@@ -31,27 +39,28 @@ const normalize = (s) =>
     .replace(/\s+/g, " ")
     .trim();
 
-const isLikelyBotOrMetaComment = (msg) => {
-  const m = normalize(msg).toLowerCase();
+const isNoiseOnly = (msg) => {
+  const m = normalize(msg);
   if (!m) return true;
   if (m.length < 2) return true;
-  if (/^(?:[\p{P}\p{S}\p{Z}\p{Emoji_Presentation}\p{Extended_Pictographic}]+)$/u.test(m)) {
-    return true;
-  }
-  if (!m.includes("?")) {
-    const words = m.split(/\s+/).filter(Boolean);
-    const fillers = new Set(["ok", "okay", "nice", "wow", "cool", "lol"]);
-    if (words.length === 1 && fillers.has(words[0])) return true;
-  }
+
+  if (/^(?:[\p{P}\p{S}\p{Z}]+)$/u.test(m)) return true;
+  if (/^(?:[\p{Z}\p{Emoji_Presentation}\p{Extended_Pictographic}]+)$/u.test(m)) return true;
+
   return false;
+};
+
+// parent_id != post_id => это ответ в ветке
+const isReplyEvent = (value) => {
+  const postId = String(value?.post_id || "");
+  const parentId = String(value?.parent_id || "");
+  if (!postId || !parentId) return false;
+  return parentId !== postId;
 };
 
 const fetchComment = async (commentId, pageToken) => {
   const url = new URL(`${GRAPH_API_BASE}/${commentId}`);
-  url.searchParams.set(
-    "fields",
-    "message,from{id,name},permalink_url,parent{id,from{id,name}}"
-  );
+  url.searchParams.set("fields", "message,from{id,name},permalink_url");
   url.searchParams.set("access_token", pageToken);
 
   const r = await fetch(url.toString());
@@ -102,17 +111,21 @@ const extractOpenAiText = (data) => {
 const trimReply = (text, maxChars = 200) => {
   const t = String(text || "").trim();
   if (t.length <= maxChars) return t;
+
   const clipped = t.slice(0, maxChars);
   const lastSentenceEnd = Math.max(
     clipped.lastIndexOf("."),
     clipped.lastIndexOf("!"),
     clipped.lastIndexOf("?")
   );
+
   if (lastSentenceEnd > 0) return clipped.slice(0, lastSentenceEnd + 1).trim();
   return clipped.trim();
 };
 
-const generateReply = async (comment) => {
+const looksNotEnglish = (text) => /[А-Яа-яЁё]/.test(String(text || ""));
+
+const callOpenAi = async (input, temperature = 0.7) => {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) throw new Error("OPENAI_API_KEY missing");
 
@@ -126,8 +139,9 @@ const generateReply = async (comment) => {
     },
     body: JSON.stringify({
       model,
-      input: buildPrompt(comment),
-      temperature: 0.7
+      input,
+      temperature,
+      max_output_tokens: 120
     })
   });
 
@@ -137,9 +151,27 @@ const generateReply = async (comment) => {
   }
 
   const data = await r.json();
-  const reply = trimReply(extractOpenAiText(data));
-  if (!reply) throw new Error("Empty OpenAI reply");
-  return reply;
+  return extractOpenAiText(data);
+};
+
+const generateReply = async (comment) => {
+  const first = trimReply(await callOpenAi(buildPrompt(comment), 0.7));
+  if (!first) throw new Error("Empty OpenAI reply");
+
+  if (!looksNotEnglish(first)) return first;
+
+  const retryPrompt = [
+    "Rewrite the reply strictly in English.",
+    "Keep it 1 to 2 short sentences.",
+    "End with exactly one question.",
+    "",
+    `Reply to rewrite: "${first}"`
+  ].join("\n");
+
+  const second = trimReply(await callOpenAi(retryPrompt, 0.3));
+  if (second && !looksNotEnglish(second)) return second;
+
+  return first;
 };
 
 const postReply = async (commentId, text, pageToken) => {
@@ -159,11 +191,50 @@ const postReply = async (commentId, text, pageToken) => {
   return r.json();
 };
 
+const pickId = (obj) => String(obj?.id || obj?.comment_id || obj?.commentId || "").trim();
+
+let runtimePageId = String(process.env.PAGE_ID || "").trim();
+let pageIdResolveAttempted = false;
+
+const resolvePageIdOnce = async (pageToken) => {
+  if (runtimePageId) return;
+  if (pageIdResolveAttempted) return;
+  pageIdResolveAttempted = true;
+
+  try {
+    const url = new URL(`${GRAPH_API_BASE}/me`);
+    url.searchParams.set("fields", "id,name");
+    url.searchParams.set("access_token", pageToken);
+
+    const r = await fetch(url.toString());
+    if (!r.ok) {
+      const t = await r.text();
+      console.log("PAGE_ID_AUTO_RESOLVE_FAILED", r.status, t.slice(0, 500));
+      return;
+    }
+
+    const data = await r.json();
+    if (data?.id) {
+      runtimePageId = String(data.id).trim();
+      console.log("PAGE_ID_AUTO_RESOLVED", runtimePageId, data?.name || "");
+    }
+  } catch (e) {
+    console.log("PAGE_ID_AUTO_RESOLVE_ERROR", String(e));
+  }
+};
+
 const scheduleQueueProcessing = () => {
   if (processingQueue) return;
   processingQueue = true;
 
   const runNext = async () => {
+    if (!isBotEnabled()) {
+      replyQueue.length = 0;
+      processingQueue = false;
+      console.log("BOT_DISABLED_CLEAR_QUEUE");
+      return;
+    }
+
     if (!replyQueue.length) {
       processingQueue = false;
       return;
@@ -179,9 +250,7 @@ const scheduleQueueProcessing = () => {
     const task = replyQueue.shift();
     try {
       const replied = await task();
-      if (replied) {
-        lastReplyAt = Date.now();
-      }
+      if (replied) lastReplyAt = Date.now();
     } catch (err) {
       console.error("QUEUE_TASK_ERROR", err);
     } finally {
@@ -211,26 +280,13 @@ const extractCommentId = (v) => {
   return "";
 };
 
-const isReplyToPage = (comment, pageId) => {
-  if (!pageId) return false;
-  return String(comment?.parent?.from?.id || "") === String(pageId);
-};
-
-const isWebhookReplyToPage = (value, pageId) => {
-  if (!pageId) return false;
-  const parentId = String(value?.parent_id || "");
-  if (!parentId) return false;
-  return parentId.startsWith(`${pageId}_`);
-};
-
 app.post("/webhook", (req, res) => {
   console.log("WEBHOOK IN", new Date().toISOString());
   res.sendStatus(200);
 
   setImmediate(async () => {
     try {
-      const botEnabled = String(process.env.BOT_ENABLED || "").trim() === "1";
-      if (!botEnabled) {
+      if (!isBotEnabled()) {
         console.log("BOT_DISABLED");
         return;
       }
@@ -239,28 +295,36 @@ app.post("/webhook", (req, res) => {
       if (!entries.length) return;
 
       const pageToken = process.env.FB_PAGE_TOKEN;
-      const pageId = String(process.env.PAGE_ID || "").trim();
       if (!pageToken) throw new Error("FB_PAGE_TOKEN missing");
+
+      await resolvePageIdOnce(pageToken);
+      const pageId = String(runtimePageId || "").trim();
 
       for (const e of entries) {
         const changes = Array.isArray(e?.changes) ? e.changes : [];
         for (const c of changes) {
           const value = c?.value;
+
+          if (c?.field !== "feed" || value?.item !== "comment" || value?.verb !== "add") {
+            continue;
+          }
+
           const commentId = extractCommentId(value);
           if (!commentId) continue;
+
           if (wasProcessed(commentId)) {
             console.log("SKIP_DUPLICATE", commentId);
             continue;
           }
 
-          if (c?.field !== "feed" || value?.item !== "comment" || value?.verb !== "add") {
-            console.log("SKIP_EVENT", c?.field, value?.item, value?.verb);
+          if (inflight.has(commentId)) {
+            console.log("SKIP_INFLIGHT", commentId);
             continue;
           }
 
-          if (isWebhookReplyToPage(value, pageId)) {
+          if (!replyToRepliesEnabled() && isReplyEvent(value)) {
             rememberComment(commentId);
-            console.log("SKIP_REPLY_TO_PAGE", commentId);
+            console.log("SKIP_REPLY_THREAD", commentId);
             continue;
           }
 
@@ -270,33 +334,47 @@ app.post("/webhook", (req, res) => {
             continue;
           }
 
+          inflight.add(commentId);
+
           replyQueue.push(async () => {
-            const comment = await fetchComment(commentId, pageToken);
+            try {
+              if (!isBotEnabled()) {
+                console.log("BOT_DISABLED_DROP", commentId);
+                return false;
+              }
 
-            if (pageId && String(comment?.from?.id || "") === pageId) {
+              if (wasProcessed(commentId)) {
+                console.log("SKIP_DUPLICATE_LATE", commentId);
+                return false;
+              }
+
+              const comment = await fetchComment(commentId, pageToken);
+
+              if (pageId && String(comment?.from?.id || "") === pageId) {
+                rememberComment(commentId);
+                console.log("SKIP_SELF", commentId);
+                return false;
+              }
+
+              if (isNoiseOnly(comment?.message)) {
+                rememberComment(commentId);
+                console.log("SKIP_NOISE", commentId);
+                return false;
+              }
+
+              const reply = await generateReply(comment);
+              const posted = await postReply(commentId, reply, pageToken);
+
               rememberComment(commentId);
-              console.log("SKIP_SELF", commentId);
-              return false;
+
+              const postedId = pickId(posted);
+              if (postedId) rememberComment(postedId);
+
+              console.log("REPLIED", comment?.permalink_url || commentId, reply, postedId);
+              return true;
+            } finally {
+              inflight.delete(commentId);
             }
-
-            if (isReplyToPage(comment, pageId)) {
-              rememberComment(commentId);
-              console.log("SKIP_REPLY_TO_PAGE", commentId);
-              return false;
-            }
-
-            if (isLikelyBotOrMetaComment(comment?.message)) {
-              rememberComment(commentId);
-              console.log("SKIP_NOISE", commentId);
-              return false;
-            }
-
-            const reply = await generateReply(comment);
-            await postReply(commentId, reply, pageToken);
-            rememberComment(commentId);
-
-            console.log("REPLIED", comment?.permalink_url || commentId, reply);
-            return true;
           });
 
           scheduleQueueProcessing();
