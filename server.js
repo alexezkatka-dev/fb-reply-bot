@@ -933,19 +933,19 @@ app.post("/webhook", (req, res) => {
           if (c?.field !== "feed") continue;
 
           const value = c?.value || {};
-          const item = String(value?.item || "").trim(); // comment, status, post, video, etc
+          const item = String(value?.item || "").trim(); // comment, status, post, video, reaction, etc
           const verb = String(value?.verb || "").trim(); // add, edited, remove
           const postId = String(extractPostId(value) || "").trim();
 
-          // NEW POST => BAIT COMMENT
+          // NEW POST => BAIT COMMENT (фильтр: только реальные публикации, не reaction)
+          const NEW_POST_ITEMS = new Set(["post", "video", "photo", "status", "share"]);
           if (
             BAIT_ENABLED &&
             BAIT_ON_NEW_POST &&
             verb === "add" &&
             postId &&
-            item &&
-            item !== "comment" &&
-            Number(value?.published || 1) === 1
+            NEW_POST_ITEMS.has(item) &&
+            Number(value?.published ?? 1) === 1
           ) {
             await ensureBaitForPost(postId, pageToken, ts, `new_post_item=${item}`);
           }
