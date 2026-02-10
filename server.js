@@ -1,4 +1,4 @@
-console.log("SERVER VERSION 2024-02-11 WEBHOOK PROD");
+console.log("SERVER VERSION 2026-02-11 WEBHOOK PROD");
 
 const express = require("express");
 const fetch = require("node-fetch");
@@ -45,8 +45,9 @@ const MAX_REPLIES_PER_HOUR = Number(process.env.MAX_REPLIES_PER_HOUR || 40);
 const MAX_REPLIES_PER_DAY = Number(process.env.MAX_REPLIES_PER_DAY || 300);
 const MAX_BOT_REPLIES_PER_THREAD = Number(process.env.MAX_BOT_REPLIES_PER_THREAD || 3);
 
-const REPLY_PROB_TOP = Number(process.env.REPLY_PROB_TOP || 0.9);
-const REPLY_PROB_REPLY = Number(process.env.REPLY_PROB_REPLY || 0.7);
+// по умолчанию отвечаем на все, можно опустить через env
+const REPLY_PROB_TOP = Number(process.env.REPLY_PROB_TOP || 1);
+const REPLY_PROB_REPLY = Number(process.env.REPLY_PROB_REPLY || 1);
 
 const IGNORE_OLD_COMMENTS_MIN = Number(process.env.IGNORE_OLD_COMMENTS_MIN || 5);
 
@@ -69,6 +70,18 @@ const replyDay = [];
 const threadReplies = new Map();
 
 const inflight = new Set();
+
+// BAIT COMMENT (для закрепа)
+const BAIT_ENABLED = String(process.env.BAIT_ENABLED || "1").trim() === "1";
+const BAIT_ON_NEW_POST = String(process.env.BAIT_ON_NEW_POST || "1").trim() === "1";
+const BAIT_ON_FIRST_COMMENT = String(process.env.BAIT_ON_FIRST_COMMENT || "1").trim() === "1";
+const BAIT_DELAY_MIN_MS = Number(process.env.BAIT_DELAY_MIN_MS || 1500);
+const BAIT_DELAY_MAX_MS = Number(process.env.BAIT_DELAY_MAX_MS || 4000);
+const BAIT_CACHE_TTL_MS = Number(process.env.BAIT_CACHE_TTL_MS || 7 * 24 * 60 * 60 * 1000);
+const BAIT_MAX_CHARS = Number(process.env.BAIT_MAX_CHARS || 220);
+
+const baitCache = new Map(); // postId -> { ts, commentId, text }
+const baitInflight = new Set(); // postId
 
 const isBotEnabled = () => String(process.env.BOT_ENABLED || "").trim() === "1";
 // По умолчанию 1. Выключение: REPLY_TO_REPLIES=0
@@ -168,11 +181,6 @@ const isNoiseOnly = (msg) => {
   if (/^(?:[\p{P}\p{S}\p{Z}]+)$/u.test(m)) return true;
   if (/^(?:[\p{Z}\p{Emoji_Presentation}\p{Extended_Pictographic}]+)$/u.test(m)) return true;
 
-  const low = m.toLowerCase();
-  const words = low.split(/\s+/).filter(Boolean);
-  const fillers = new Set(["ok", "okay", "nice", "wow", "cool", "lol", "thanks", "thx", "great", "good", "gg"]);
-  if (words.length === 1 && fillers.has(words[0])) return true;
-
   return false;
 };
 
@@ -183,18 +191,42 @@ const getFirstName = (fullName) => {
   return first.slice(0, 24);
 };
 
+const extractLocation = (text) => {
+  const s = normalize(text);
+  if (!s) return "";
+
+  const m = s.match(/\b(?:from|in|here in|out in)\s+([A-Za-z][A-Za-z .'-]{2,40})(?:,\s*([A-Z]{2}))?\b/i);
+  if (!m) return "";
+
+  const raw = normalize(m[1] || "");
+  const st = normalize(m[2] || "");
+
+  const bad = new Set(["this", "the", "a", "my", "your", "that", "it", "here", "there", "video", "post", "comments", "thread"]);
+  const firstWord = raw.split(/\s+/)[0]?.toLowerCase() || "";
+  if (bad.has(firstWord)) return "";
+
+  const cleaned = raw.replace(/[^A-Za-z .'-]/g, "").trim();
+  if (!cleaned) return "";
+
+  if (st && /^[A-Z]{2}$/.test(st)) return `${cleaned}, ${st}`;
+  return cleaned;
+};
+
 const analyzeSignals = (comment) => {
-  const msg = normalize(comment?.message).toLowerCase();
-  const parent = normalize(comment?.parent?.message).toLowerCase();
+  const msg = normalize(comment?.message);
+  const parent = normalize(comment?.parent?.message);
   const joined = `${parent} ${msg}`.trim();
 
   const sarcasmLikely =
-    /\/s\b|sarcasm|yeah right|sure buddy|my life is changed|what a discovery|captain obvious|thanks a lot/i.test(joined);
+    /\/s\b|sarcasm|yeah right|sure buddy|what a discovery|captain obvious|thanks a lot/i.test(joined);
 
   const jinxingLikely =
     /\bjinx\b|don't jinx|dont jinx|knock on wood|appliance gods|curse|hex|now you're gonna have|now youre gonna have|you'll have problems|youll have problems/i.test(
       joined
     );
+
+  const bsLikely =
+    /\b(bullshit|bs|b\s*s|not true|fake|doesn'?t work|does not work|waste of time|scam)\b/i.test(joined);
 
   const debateLikely =
     /\bfake\b|\bcap\b|\bbs\b|doesn'?t work|works\b|i tried|tried it|tested|no it|nah it/i.test(joined);
@@ -202,7 +234,14 @@ const analyzeSignals = (comment) => {
   const worryLikely =
     /\bgonna break\b|\bgoing to break\b|break my|crack|damage|ruin|snap|strip the/i.test(joined);
 
-  return { sarcasmLikely, jinxingLikely, debateLikely, worryLikely };
+  const praiseLikely =
+    /\b(thanks|thank you|helped|works|worked|love this|awesome|great|genius|saved me|life saver)\b/i.test(joined);
+
+  const questionLikely = /\?/.test(msg);
+
+  const location = extractLocation(joined);
+
+  return { sarcasmLikely, jinxingLikely, bsLikely, debateLikely, worryLikely, praiseLikely, questionLikely, location };
 };
 
 // parent_id != post_id => это ответ в ветке
@@ -366,31 +405,42 @@ const buildPrompt = (comment, postContext, meta = {}) => {
 
   const signals = meta?.signals || {};
   const isReplyInThread = Boolean(meta?.isReply);
+  const location = normalize(meta?.location || signals.location || "");
 
   const sigLine = [
     `jinxingLikely=${signals.jinxingLikely ? "true" : "false"}`,
     `sarcasmLikely=${signals.sarcasmLikely ? "true" : "false"}`,
+    `bsLikely=${signals.bsLikely ? "true" : "false"}`,
     `debateLikely=${signals.debateLikely ? "true" : "false"}`,
     `worryLikely=${signals.worryLikely ? "true" : "false"}`,
+    `praiseLikely=${signals.praiseLikely ? "true" : "false"}`,
+    `questionLikely=${signals.questionLikely ? "true" : "false"}`,
+    `location=${location ? `"${location}"` : "none"}`,
     `isReplyInThread=${isReplyInThread ? "true" : "false"}`
   ].join(", ");
 
   const lines = [
-    "You are the creator/admin of a US-based household life hacks page.",
+    "Role: You manage the T.Lifehack USA Facebook/Reels channel. You are a savvy, friendly, witty American creator.",
+    "Goal: maximize engagement, push saves, grow community.",
+    "",
     "Reply ONLY in English.",
-    "Sound human, witty, and chatty, like you're in the comments with them.",
-    "Use contractions and casual slang when it fits: don't, it's, you're, gonna, kinda, yep, nah.",
-    "Keep it kind. Light teasing is ok. No insults.",
+    "Sound human, friendly, witty, like you're in the comments with them.",
+    "Use contractions: don't, it's, you're, gonna, kinda, yep, nah.",
     "Write 1 to 3 short sentences total.",
-    "Use 0 to 2 emojis total. No hashtags.",
+    "Use 1 to 2 relevant emojis total. No hashtags.",
     "Do not mention AI, bots, automation, or policies.",
-    "End with EXACTLY ONE question that invites a reply.",
+    "ALWAYS end with EXACTLY ONE question that invites a reply.",
     "The question must match the topic and the thread. No generic questions.",
-    "If signals.jinxingLikely is true, use jinx culture. Consider starting with 'Knock on wood' and a playful superstition line.",
-    "If signals.sarcasmLikely is true, lean into the sarcasm with a self-aware joke, then bring it back to the practical point.",
-    "If signals.debateLikely is true and this is a reply thread, jump into the debate in a playful way and ask for one concrete detail from one person.",
-    "If signals.worryLikely is true, calm them down and keep it safe. Suggest going slow and stopping if it feels wrong.",
-    "If names exist, you may use FIRST NAMES, at most once in the whole reply.",
+    "",
+    "Logic rules:",
+    "1) If bsLikely is true, use the BS strategy: empathize, say it worked for you, invite others to share real results.",
+    "2) If sarcasmLikely is true, answer with wit, then anchor it to a practical point.",
+    "3) If jinxingLikely is true, use: 'Knock on wood' culture.",
+    "4) If location is present, acknowledge it with weather vibe, like: 'Stay warm out there in [Location]'.",
+    "5) If praiseLikely is true, add a save trigger in the reply: 'Save this video'.",
+    "6) If questionLikely is true, add a curiosity gap cue tied to the video, like: 'rewatch around 0:45'.",
+    "7) If this is a reply thread and people are chatting, jump in briefly and keep it playful.",
+    "8) If nothing special triggers, be relatable: admit you were surprised too.",
     "",
     `Context signals: ${sigLine}`,
     ""
@@ -410,19 +460,34 @@ const buildPrompt = (comment, postContext, meta = {}) => {
   lines.push(`New comment (${userFirst || "viewer"}): "${text}"`);
   lines.push("");
 
-  lines.push("Style examples to match the vibe, do not copy word for word:");
-  lines.push(
-    '1) Jinxing: "Knock on wood! 🪵👊 Don’t let the appliance gods hear you. Hope it lasts another 20 years. What brand is it?"'
-  );
-  lines.push(
-    '2) Sarcasm: "Haha, fair. It’s not rocket science 🚀 but if it saves a repair bill, I’m in. Would you try it or nah?"'
-  );
-  lines.push(
-    '3) Debate: "Love the debate 😂 Team ‘It Works’ is loud today. What exactly failed for you, firstName?"'
-  );
-  lines.push(
-    '4) Worried: "Easy does it 🔧 Tiny turn only, don’t force it. What kind of window hardware do you have?"'
-  );
+  return lines.join("\n");
+};
+
+const buildBaitPrompt = (postContext) => {
+  const ctx = normalize(postContext);
+
+  const lines = [
+    "Task: Write ONE engagement bait comment for a new T.Lifehack USA video.",
+    "Goal: spark debate, opinions, arguments, and 'I didn’t know' reactions.",
+    "Strategy: use a polarizing question or a challenge.",
+    "",
+    "Rules:",
+    "Reply ONLY in English.",
+    "Write 1 to 2 short sentences.",
+    "Use 1 to 2 emojis.",
+    "No hashtags.",
+    "Do not mention pinning, bots, AI, or automation.",
+    "Make it specific to the post context. Use the object from the hack if visible in context.",
+    "End with EXACTLY ONE question.",
+    "",
+    "Examples style (do not copy):",
+    "Team A vs Team B. Which side are you on?",
+    "Scale 1-10. How surprising was this?",
+    "",
+    "Post context:",
+    ctx || "(no context)",
+    ""
+  ];
 
   return lines.join("\n");
 };
@@ -491,7 +556,7 @@ const enforceOneQuestionAtEnd = (text) => {
 
 const looksNotEnglish = (text) => /[А-Яа-яЁё]/.test(String(text || ""));
 
-const callOpenAi = async (input, temperature = 0.7) => {
+const callOpenAi = async (input, temperature = 0.7, maxTokens = 180) => {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) throw new Error("OPENAI_API_KEY missing");
 
@@ -507,7 +572,7 @@ const callOpenAi = async (input, temperature = 0.7) => {
       model,
       input,
       temperature,
-      max_output_tokens: 180
+      max_output_tokens: maxTokens
     })
   });
 
@@ -521,7 +586,7 @@ const callOpenAi = async (input, temperature = 0.7) => {
 };
 
 const generateReply = async (comment, postContext, meta = {}) => {
-  let first = trimReply(await callOpenAi(buildPrompt(comment, postContext, meta), 0.9), 240);
+  let first = trimReply(await callOpenAi(buildPrompt(comment, postContext, meta), 0.9, 180), 240);
   first = enforceOneQuestionAtEnd(first);
 
   if (!first) throw new Error("Empty OpenAI reply");
@@ -531,12 +596,38 @@ const generateReply = async (comment, postContext, meta = {}) => {
     "Rewrite the reply strictly in English.",
     "Keep the same witty, human tone and contractions.",
     "Write 1 to 3 short sentences.",
+    "Use 1 to 2 emojis.",
     "End with exactly one question.",
     "",
     `Reply to rewrite: "${first}"`
   ].join("\n");
 
-  let second = trimReply(await callOpenAi(retryPrompt, 0.4), 240);
+  let second = trimReply(await callOpenAi(retryPrompt, 0.4, 180), 240);
+  second = enforceOneQuestionAtEnd(second);
+
+  if (second && !looksNotEnglish(second)) return second;
+
+  return first;
+};
+
+const generateBaitComment = async (postContext) => {
+  let first = trimReply(await callOpenAi(buildBaitPrompt(postContext), 0.95, 140), BAIT_MAX_CHARS);
+  first = enforceOneQuestionAtEnd(first);
+
+  if (!first) throw new Error("Empty OpenAI bait");
+  if (!looksNotEnglish(first)) return first;
+
+  const retryPrompt = [
+    "Rewrite strictly in English.",
+    "Write 1 to 2 short sentences.",
+    "Use 1 to 2 emojis.",
+    "End with exactly one question.",
+    "No hashtags.",
+    "",
+    `Text: "${first}"`
+  ].join("\n");
+
+  let second = trimReply(await callOpenAi(retryPrompt, 0.35, 140), BAIT_MAX_CHARS);
   second = enforceOneQuestionAtEnd(second);
 
   if (second && !looksNotEnglish(second)) return second;
@@ -557,6 +648,23 @@ const postReply = async (commentId, text, pageToken) => {
   if (!r.ok) {
     const t = await r.text();
     throw new Error(`Post reply failed ${r.status}: ${t}`);
+  }
+  return r.json();
+};
+
+const postCommentOnPost = async (postId, text, pageToken) => {
+  const r = await fetch(`${GRAPH_API_BASE}/${postId}/comments`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      message: text,
+      access_token: pageToken
+    })
+  });
+
+  if (!r.ok) {
+    const t = await r.text();
+    throw new Error(`Post comment failed ${r.status}: ${t}`);
   }
   return r.json();
 };
@@ -685,6 +793,92 @@ const scheduleQueueProcessing = () => {
   setImmediate(runNext);
 };
 
+const pruneBaitCache = () => {
+  const cutoff = nowMs() - BAIT_CACHE_TTL_MS;
+  for (const [k, v] of baitCache.entries()) {
+    if (!v || v.ts < cutoff) baitCache.delete(k);
+  }
+};
+
+const wasBaitPosted = (postId) => {
+  pruneBaitCache();
+  const v = baitCache.get(postId);
+  if (!v) return false;
+  if (nowMs() - v.ts > BAIT_CACHE_TTL_MS) {
+    baitCache.delete(postId);
+    return false;
+  }
+  return true;
+};
+
+const markBaitPosted = (postId, commentId, text) => {
+  pruneBaitCache();
+  baitCache.set(postId, { ts: nowMs(), commentId: String(commentId || ""), text: String(text || "") });
+};
+
+const ensureBaitForPost = async (postId, pageToken, ts, reason) => {
+  if (!BAIT_ENABLED) return;
+  const pid = String(postId || "").trim();
+  if (!pid) return;
+
+  if (wasBaitPosted(pid)) return;
+  if (baitInflight.has(pid)) return;
+
+  // очередь ограничена
+  if (replyQueue.length + 1 > MAX_QUEUE_LENGTH) {
+    logSkip("BAIT_QUEUE_FULL", { postId: pid, queueLen: replyQueue.length, reason });
+    return;
+  }
+
+  baitInflight.add(pid);
+
+  const dueAt = Date.now() + randInt(BAIT_DELAY_MIN_MS, BAIT_DELAY_MAX_MS);
+
+  replyQueue.push({
+    type: "bait",
+    postId: pid,
+    dueAt,
+    run: async () => {
+      try {
+        if (!isBotEnabled()) return false;
+        if (wasBaitPosted(pid)) return false;
+
+        const postContext = await getPostContext(pid, pageToken);
+        const bait = await generateBaitComment(postContext);
+
+        const posted = await postCommentOnPost(pid, bait, pageToken);
+        const postedId = pickId(posted);
+
+        markBaitPosted(pid, postedId, bait);
+
+        if (postedId) rememberComment(postedId);
+
+        logJson("BAIT_POSTED", {
+          at: ts,
+          postId: pid,
+          postedId,
+          bait,
+          reason
+        });
+
+        return true;
+      } catch (e) {
+        logJson("BAIT_FAILED", {
+          at: ts,
+          postId: pid,
+          reason,
+          err: String(e).slice(0, 300)
+        });
+        return false;
+      } finally {
+        baitInflight.delete(pid);
+      }
+    }
+  });
+
+  scheduleQueueProcessing();
+};
+
 app.get("/webhook", (req, res) => {
   const mode = req.query["hub.mode"];
   const token = req.query["hub.verify_token"];
@@ -701,6 +895,14 @@ const extractCommentId = (v) => {
   if (typeof v.comment_id === "string") return v.comment_id;
   if (v.comment?.id) return v.comment.id;
   if (v.commentId) return v.commentId;
+  return "";
+};
+
+const extractPostId = (v) => {
+  if (!v) return "";
+  if (typeof v.post_id === "string") return v.post_id;
+  if (typeof v.postId === "string") return v.postId;
+  if (typeof v.id === "string") return v.id;
   return "";
 };
 
@@ -728,16 +930,32 @@ app.post("/webhook", (req, res) => {
       for (const e of entries) {
         const changes = Array.isArray(e?.changes) ? e.changes : [];
         for (const c of changes) {
-          const value = c?.value;
+          if (c?.field !== "feed") continue;
 
-          if (c?.field !== "feed" || value?.item !== "comment" || value?.verb !== "add") {
-            continue;
+          const value = c?.value || {};
+          const item = String(value?.item || "").trim(); // comment, status, post, video, etc
+          const verb = String(value?.verb || "").trim(); // add, edited, remove
+          const postId = String(extractPostId(value) || "").trim();
+
+          // NEW POST => BAIT COMMENT
+          if (
+            BAIT_ENABLED &&
+            BAIT_ON_NEW_POST &&
+            verb === "add" &&
+            postId &&
+            item &&
+            item !== "comment" &&
+            Number(value?.published || 1) === 1
+          ) {
+            await ensureBaitForPost(postId, pageToken, ts, `new_post_item=${item}`);
           }
+
+          // COMMENTS
+          if (item !== "comment" || verb !== "add") continue;
 
           const commentId = extractCommentId(value);
           if (!commentId) continue;
 
-          const postId = String(value?.post_id || "").trim();
           const parentId = String(value?.parent_id || "").trim();
           const isReply = isReplyEvent(value);
           const threadKey = getThreadKey(value, commentId);
@@ -748,9 +966,15 @@ app.post("/webhook", (req, res) => {
             postId,
             parentId,
             isReply,
+            item,
+            verb,
             created_time: value?.created_time || null,
             queueLen: replyQueue.length
           });
+
+          if (BAIT_ENABLED && BAIT_ON_FIRST_COMMENT && postId) {
+            await ensureBaitForPost(postId, pageToken, ts, "first_comment_fallback");
+          }
 
           if (wasProcessed(commentId)) {
             logSkip("DUPLICATE", { commentId, postId, threadKey });
@@ -929,11 +1153,14 @@ app.post("/webhook", (req, res) => {
 
                 const msgNow = safeSlice(src?.message || msgForLog, SKIP_MESSAGE_MAX_CHARS);
 
+                const signals = analyzeSignals(src);
+
                 const meta = {
                   isReply: Boolean(src?.parent?.id) || Boolean(isReply),
                   userName: String(src?.from?.name || fromForLog || ""),
                   parentName: String(src?.parent?.from?.name || parentFromForLog || ""),
-                  signals: analyzeSignals(src)
+                  location: signals.location,
+                  signals
                 };
 
                 const postContext = await getPostContext(postId, pageToken);
