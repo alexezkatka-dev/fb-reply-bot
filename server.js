@@ -1,4 +1,4 @@
-console.log("SERVER VERSION 2026-02-11 WEBHOOK PROD");
+console.log("SERVER VERSION 2026-02-11 WEBHOOK PROD FIX1");
 
 const express = require("express");
 const fetch = require("node-fetch");
@@ -82,6 +82,9 @@ const BAIT_MAX_CHARS = Number(process.env.BAIT_MAX_CHARS || 220);
 
 const baitCache = new Map(); // postId -> { ts, commentId, text }
 const baitInflight = new Set(); // postId
+
+// BAIT на "новый пост" только для реальных публикаций
+const NEW_POST_ITEMS = new Set(["post", "video", "photo"]);
 
 const isBotEnabled = () => String(process.env.BOT_ENABLED || "").trim() === "1";
 // По умолчанию 1. Выключение: REPLY_TO_REPLIES=0
@@ -821,6 +824,11 @@ const ensureBaitForPost = async (postId, pageToken, ts, reason) => {
   const pid = String(postId || "").trim();
   if (!pid) return;
 
+  if (!pid.includes("_")) {
+    logSkip("BAIT_BAD_POST_ID", { postId: pid, reason });
+    return;
+  }
+
   if (wasBaitPosted(pid)) return;
   if (baitInflight.has(pid)) return;
 
@@ -902,7 +910,6 @@ const extractPostId = (v) => {
   if (!v) return "";
   if (typeof v.post_id === "string") return v.post_id;
   if (typeof v.postId === "string") return v.postId;
-  if (typeof v.id === "string") return v.id;
   return "";
 };
 
@@ -933,12 +940,11 @@ app.post("/webhook", (req, res) => {
           if (c?.field !== "feed") continue;
 
           const value = c?.value || {};
-          const item = String(value?.item || "").trim(); // comment, status, post, video, reaction, etc
+          const item = String(value?.item || "").trim(); // comment, post, video, photo, reaction, etc
           const verb = String(value?.verb || "").trim(); // add, edited, remove
           const postId = String(extractPostId(value) || "").trim();
 
-          // NEW POST => BAIT COMMENT (фильтр: только реальные публикации, не reaction)
-          const NEW_POST_ITEMS = new Set(["post", "video", "photo", "status", "share"]);
+          // NEW POST => BAIT COMMENT (только реальные публикации)
           if (
             BAIT_ENABLED &&
             BAIT_ON_NEW_POST &&
@@ -971,10 +977,6 @@ app.post("/webhook", (req, res) => {
             created_time: value?.created_time || null,
             queueLen: replyQueue.length
           });
-
-          if (BAIT_ENABLED && BAIT_ON_FIRST_COMMENT && postId) {
-            await ensureBaitForPost(postId, pageToken, ts, "first_comment_fallback");
-          }
 
           if (wasProcessed(commentId)) {
             logSkip("DUPLICATE", { commentId, postId, threadKey });
@@ -1083,6 +1085,11 @@ app.post("/webhook", (req, res) => {
             rememberComment(commentId);
             logSkip("NOISE", { commentId, postId, threadKey, msg: safeSlice(msgForLog, SKIP_MESSAGE_MAX_CHARS) });
             continue;
+          }
+
+          // BAIT на первый живой коммент, не на self и не на noise
+          if (BAIT_ENABLED && BAIT_ON_FIRST_COMMENT && postId) {
+            await ensureBaitForPost(postId, pageToken, ts, "first_comment_fallback");
           }
 
           inflight.add(commentId);
