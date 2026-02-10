@@ -1,4 +1,4 @@
-console.log("SERVER VERSION 2024-02-10 WEBHOOK PROD");
+console.log("SERVER VERSION 2024-02-11 WEBHOOK PROD");
 
 const express = require("express");
 const fetch = require("node-fetch");
@@ -176,6 +176,35 @@ const isNoiseOnly = (msg) => {
   return false;
 };
 
+const getFirstName = (fullName) => {
+  const n = normalize(fullName).replace(/[^A-Za-zÀ-ÿ' -]/g, "").trim();
+  if (!n) return "";
+  const first = n.split(/\s+/)[0] || "";
+  return first.slice(0, 24);
+};
+
+const analyzeSignals = (comment) => {
+  const msg = normalize(comment?.message).toLowerCase();
+  const parent = normalize(comment?.parent?.message).toLowerCase();
+  const joined = `${parent} ${msg}`.trim();
+
+  const sarcasmLikely =
+    /\/s\b|sarcasm|yeah right|sure buddy|my life is changed|what a discovery|captain obvious|thanks a lot/i.test(joined);
+
+  const jinxingLikely =
+    /\bjinx\b|don't jinx|dont jinx|knock on wood|appliance gods|curse|hex|now you're gonna have|now youre gonna have|you'll have problems|youll have problems/i.test(
+      joined
+    );
+
+  const debateLikely =
+    /\bfake\b|\bcap\b|\bbs\b|doesn'?t work|works\b|i tried|tried it|tested|no it|nah it/i.test(joined);
+
+  const worryLikely =
+    /\bgonna break\b|\bgoing to break\b|break my|crack|damage|ruin|snap|strip the/i.test(joined);
+
+  return { sarcasmLikely, jinxingLikely, debateLikely, worryLikely };
+};
+
 // parent_id != post_id => это ответ в ветке
 const isReplyEvent = (value) => {
   const postId = String(value?.post_id || "");
@@ -324,23 +353,46 @@ const getPostContext = async (postId, pageToken) => {
   }
 };
 
-const buildPrompt = (comment, postContext) => {
+const buildPrompt = (comment, postContext, meta = {}) => {
   const text = normalize(comment?.message);
   const parentMsg = normalize(comment?.parent?.message);
   const ctx = normalize(postContext);
 
+  const userName = normalize(meta?.userName);
+  const parentName = normalize(meta?.parentName);
+
+  const userFirst = getFirstName(userName);
+  const parentFirst = getFirstName(parentName);
+
+  const signals = meta?.signals || {};
+  const isReplyInThread = Boolean(meta?.isReply);
+
+  const sigLine = [
+    `jinxingLikely=${signals.jinxingLikely ? "true" : "false"}`,
+    `sarcasmLikely=${signals.sarcasmLikely ? "true" : "false"}`,
+    `debateLikely=${signals.debateLikely ? "true" : "false"}`,
+    `worryLikely=${signals.worryLikely ? "true" : "false"}`,
+    `isReplyInThread=${isReplyInThread ? "true" : "false"}`
+  ].join(", ");
+
   const lines = [
-    "You are a friendly admin replying to a Facebook Page comment.",
+    "You are the creator/admin of a US-based household life hacks page.",
     "Reply ONLY in English.",
-    "Write 1 to 2 short sentences total.",
-    "Friendly, helpful, natural tone.",
-    "No hashtags. Do not mention AI, bots, or policies.",
-    "Use the post context below. Keep your reply aligned with what the video/post is about.",
-    "End with EXACTLY ONE specific question that encourages a reply.",
-    "Ask a question that matches the post topic and the user comment, not generic app or version questions.",
-    "If the user asked a question, answer briefly and ask one clarifying question about their case.",
-    "If they say they will try it or thank you, ask about results or timing related to the post topic.",
-    "If they express doubt, ask what part seems wrong or what exactly they tried.",
+    "Sound human, witty, and chatty, like you're in the comments with them.",
+    "Use contractions and casual slang when it fits: don't, it's, you're, gonna, kinda, yep, nah.",
+    "Keep it kind. Light teasing is ok. No insults.",
+    "Write 1 to 3 short sentences total.",
+    "Use 0 to 2 emojis total. No hashtags.",
+    "Do not mention AI, bots, automation, or policies.",
+    "End with EXACTLY ONE question that invites a reply.",
+    "The question must match the topic and the thread. No generic questions.",
+    "If signals.jinxingLikely is true, use jinx culture. Consider starting with 'Knock on wood' and a playful superstition line.",
+    "If signals.sarcasmLikely is true, lean into the sarcasm with a self-aware joke, then bring it back to the practical point.",
+    "If signals.debateLikely is true and this is a reply thread, jump into the debate in a playful way and ask for one concrete detail from one person.",
+    "If signals.worryLikely is true, calm them down and keep it safe. Suggest going slow and stopping if it feels wrong.",
+    "If names exist, you may use FIRST NAMES, at most once in the whole reply.",
+    "",
+    `Context signals: ${sigLine}`,
     ""
   ];
 
@@ -351,11 +403,26 @@ const buildPrompt = (comment, postContext) => {
   }
 
   if (parentMsg) {
-    lines.push(`Parent comment in the thread: "${parentMsg}"`);
+    lines.push(`Parent comment (${parentFirst || "viewer"}): "${parentMsg}"`);
     lines.push("");
   }
 
-  lines.push(`User comment: "${text}"`);
+  lines.push(`New comment (${userFirst || "viewer"}): "${text}"`);
+  lines.push("");
+
+  lines.push("Style examples to match the vibe, do not copy word for word:");
+  lines.push(
+    '1) Jinxing: "Knock on wood! 🪵👊 Don’t let the appliance gods hear you. Hope it lasts another 20 years. What brand is it?"'
+  );
+  lines.push(
+    '2) Sarcasm: "Haha, fair. It’s not rocket science 🚀 but if it saves a repair bill, I’m in. Would you try it or nah?"'
+  );
+  lines.push(
+    '3) Debate: "Love the debate 😂 Team ‘It Works’ is loud today. What exactly failed for you, firstName?"'
+  );
+  lines.push(
+    '4) Worried: "Easy does it 🔧 Tiny turn only, don’t force it. What kind of window hardware do you have?"'
+  );
 
   return lines.join("\n");
 };
@@ -378,7 +445,7 @@ const extractOpenAiText = (data) => {
   return "";
 };
 
-const trimReply = (text, maxChars = 200) => {
+const trimReply = (text, maxChars = 240) => {
   const t = String(text || "").trim();
   if (t.length <= maxChars) return t;
 
@@ -391,6 +458,35 @@ const trimReply = (text, maxChars = 200) => {
 
   if (lastSentenceEnd > 0) return clipped.slice(0, lastSentenceEnd + 1).trim();
   return clipped.trim();
+};
+
+const enforceOneQuestionAtEnd = (text) => {
+  let s = String(text || "").trim();
+  if (!s) return s;
+
+  const qCount = (s.match(/\?/g) || []).length;
+  if (qCount > 1) {
+    const lastQ = s.lastIndexOf("?");
+    let before = s.slice(0, lastQ);
+    let after = s.slice(lastQ + 1);
+
+    before = before.replace(/\?/g, ".").replace(/\s+\./g, ".").trim();
+
+    if (/[A-Za-z0-9]/.test(after)) after = "";
+    after = after.replace(/\?/g, "").trim();
+
+    s = `${before}?${after ? " " + after : ""}`.trim();
+  }
+
+  const lastQ = s.lastIndexOf("?");
+  if (lastQ >= 0) {
+    const after = s.slice(lastQ + 1);
+    if (/[A-Za-z0-9]/.test(after)) {
+      s = s.slice(0, lastQ + 1).trim();
+    }
+  }
+
+  return s;
 };
 
 const looksNotEnglish = (text) => /[А-Яа-яЁё]/.test(String(text || ""));
@@ -411,7 +507,7 @@ const callOpenAi = async (input, temperature = 0.7) => {
       model,
       input,
       temperature,
-      max_output_tokens: 140
+      max_output_tokens: 180
     })
   });
 
@@ -424,21 +520,25 @@ const callOpenAi = async (input, temperature = 0.7) => {
   return extractOpenAiText(data);
 };
 
-const generateReply = async (comment, postContext) => {
-  const first = trimReply(await callOpenAi(buildPrompt(comment, postContext), 0.7));
-  if (!first) throw new Error("Empty OpenAI reply");
+const generateReply = async (comment, postContext, meta = {}) => {
+  let first = trimReply(await callOpenAi(buildPrompt(comment, postContext, meta), 0.9), 240);
+  first = enforceOneQuestionAtEnd(first);
 
+  if (!first) throw new Error("Empty OpenAI reply");
   if (!looksNotEnglish(first)) return first;
 
   const retryPrompt = [
     "Rewrite the reply strictly in English.",
-    "Keep it 1 to 2 short sentences.",
+    "Keep the same witty, human tone and contractions.",
+    "Write 1 to 3 short sentences.",
     "End with exactly one question.",
     "",
     `Reply to rewrite: "${first}"`
   ].join("\n");
 
-  const second = trimReply(await callOpenAi(retryPrompt, 0.3));
+  let second = trimReply(await callOpenAi(retryPrompt, 0.4), 240);
+  second = enforceOneQuestionAtEnd(second);
+
   if (second && !looksNotEnglish(second)) return second;
 
   return first;
@@ -694,7 +794,13 @@ app.post("/webhook", (req, res) => {
             rememberComment(commentId);
             prune(replyHour, 60 * 60 * 1000);
             prune(replyDay, 24 * 60 * 60 * 1000);
-            logSkip("RATE_LIMIT", { commentId, postId, threadKey, hourCount: replyHour.length, dayCount: replyDay.length });
+            logSkip("RATE_LIMIT", {
+              commentId,
+              postId,
+              threadKey,
+              hourCount: replyHour.length,
+              dayCount: replyDay.length
+            });
             continue;
           }
 
@@ -730,9 +836,17 @@ app.post("/webhook", (req, res) => {
 
           const msgForLog = safeSlice(comment?.message, WEBHOOK_MESSAGE_MAX_CHARS);
           const fromForLog = String(comment?.from?.name || "");
+          const parentFromForLog = String(comment?.parent?.from?.name || "");
 
           if (LOG_WEBHOOK_MESSAGE) {
-            logJson("WEBHOOK_MESSAGE", { commentId, postId, from: fromForLog, msg: msgForLog });
+            logJson("WEBHOOK_MESSAGE", {
+              commentId,
+              postId,
+              from: fromForLog,
+              msg: msgForLog,
+              parentFrom: parentFromForLog,
+              parentMsg: safeSlice(comment?.parent?.message, WEBHOOK_MESSAGE_MAX_CHARS)
+            });
           }
 
           if (pageId && String(comment?.from?.id || "") === pageId) {
@@ -811,11 +925,20 @@ app.post("/webhook", (req, res) => {
                 }
 
                 const cached = getCachedComment(commentId);
-                const msgNow = safeSlice(cached?.message || msgForLog, SKIP_MESSAGE_MAX_CHARS);
+                const src = cached || comment;
+
+                const msgNow = safeSlice(src?.message || msgForLog, SKIP_MESSAGE_MAX_CHARS);
+
+                const meta = {
+                  isReply: Boolean(src?.parent?.id) || Boolean(isReply),
+                  userName: String(src?.from?.name || fromForLog || ""),
+                  parentName: String(src?.parent?.from?.name || parentFromForLog || ""),
+                  signals: analyzeSignals(src)
+                };
 
                 const postContext = await getPostContext(postId, pageToken);
 
-                const reply = await generateReply(cached || comment, postContext);
+                const reply = await generateReply(src, postContext, meta);
                 const posted = await postReply(commentId, reply, pageToken);
 
                 rememberComment(commentId);
@@ -833,9 +956,10 @@ app.post("/webhook", (req, res) => {
                   likeDelayMs: LIKE_ENABLED ? likeDelay : 0,
                   replyAfterLikeMs: LIKE_ENABLED ? replyDelay : 0,
                   msg: LOG_WEBHOOK_MESSAGE ? msgNow : undefined,
+                  signals: LOG_WEBHOOK_MESSAGE ? meta.signals : undefined,
                   reply,
                   postedId,
-                  permalink: (cached || comment)?.permalink_url || ""
+                  permalink: src?.permalink_url || ""
                 });
 
                 return true;
