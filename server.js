@@ -1,4 +1,4 @@
-console.log("SERVER VERSION 2024-02-09 WEBHOOK PROD");
+console.log("SERVER VERSION 2024-02-10 WEBHOOK PROD");
 
 const express = require("express");
 const fetch = require("node-fetch");
@@ -12,12 +12,14 @@ const GRAPH_API_BASE = `https://graph.facebook.com/${GRAPH_API_VERSION}`;
 const MAX_PROCESSED = 5000;
 const processedComments = new Map();
 
-// очередь: храним задачи с временем, когда их разрешено выполнять
+// очередь: задачи с временем, когда их разрешено выполнять
 const replyQueue = [];
 let processingQueue = false;
 
 // глобальная защита “между ответами”
 let nextReplyAllowedAt = 0;
+// глобальная защита “между лайками”
+let nextLikeAllowedAt = 0;
 
 const MAX_QUEUE_LENGTH = Number(process.env.MAX_QUEUE_LENGTH || 20);
 
@@ -26,6 +28,17 @@ const FIRST_REPLY_MAX_MS = Number(process.env.FIRST_REPLY_MAX_MS || 30000);
 
 const BETWEEN_REPLY_MIN_MS = Number(process.env.BETWEEN_REPLY_MIN_MS || 15000);
 const BETWEEN_REPLY_MAX_MS = Number(process.env.BETWEEN_REPLY_MAX_MS || 45000);
+
+// лайк перед ответом
+const LIKE_ENABLED = String(process.env.LIKE_ENABLED || "1").trim() === "1";
+const LIKE_MIN_MS = Number(process.env.LIKE_MIN_MS || 0);
+const LIKE_MAX_MS = Number(process.env.LIKE_MAX_MS || 3000);
+
+const REPLY_AFTER_LIKE_MIN_MS = Number(process.env.REPLY_AFTER_LIKE_MIN_MS || 25000);
+const REPLY_AFTER_LIKE_MAX_MS = Number(process.env.REPLY_AFTER_LIKE_MAX_MS || 60000);
+
+const BETWEEN_LIKE_MIN_MS = Number(process.env.BETWEEN_LIKE_MIN_MS || 2000);
+const BETWEEN_LIKE_MAX_MS = Number(process.env.BETWEEN_LIKE_MAX_MS || 8000);
 
 // лимиты и вероятности
 const MAX_REPLIES_PER_HOUR = Number(process.env.MAX_REPLIES_PER_HOUR || 40);
@@ -78,13 +91,8 @@ const logJson = (tag, obj) => {
   }
 };
 
-const logWebhookEvent = (meta) => {
-  logJson("WEBHOOK_EVENT", meta || {});
-};
-
-const logSkip = (reason, meta) => {
-  logJson("SKIP", { reason, ...(meta || {}) });
-};
+const logWebhookEvent = (meta) => logJson("WEBHOOK_EVENT", meta || {});
+const logSkip = (reason, meta) => logJson("SKIP", { reason, ...(meta || {}) });
 
 const randInt = (min, max) => {
   const a = Number(min);
@@ -99,7 +107,7 @@ const prune = (arr, windowMs) => {
   while (arr.length && arr[0] < cutoff) arr.shift();
 };
 
-const canReplyByRate = () => {
+const allowReplyByRate = () => {
   prune(replyHour, 60 * 60 * 1000);
   prune(replyDay, 24 * 60 * 60 * 1000);
   return replyHour.length < MAX_REPLIES_PER_HOUR && replyDay.length < MAX_REPLIES_PER_DAY;
@@ -125,7 +133,7 @@ const getThreadKey = (value, commentId) => {
   return commentId;
 };
 
-const canReplyInThread = (threadKey) => {
+const allowReplyInThread = (threadKey) => {
   pruneThreadReplies();
   const cur = threadReplies.get(threadKey);
   const count = Number(cur?.count || 0);
@@ -213,6 +221,36 @@ const fetchComment = async (commentId, pageToken) => {
     throw new Error(`Fetch comment failed ${r.status}: ${t}`);
   }
   return r.json();
+};
+
+const readGraphResult = async (r) => {
+  const t = await r.text();
+  if (!t) return null;
+  try {
+    return JSON.parse(t);
+  } catch (_) {
+    return t;
+  }
+};
+
+const likeComment = async (commentId, pageToken) => {
+  const r = await fetch(`${GRAPH_API_BASE}/${commentId}/likes`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ access_token: pageToken })
+  });
+
+  if (!r.ok) {
+    const t = await r.text();
+    throw new Error(`Like failed ${r.status}: ${t}`);
+  }
+
+  const data = await readGraphResult(r);
+  if (data === true) return true;
+  if (data === "true") return true;
+  if (data && typeof data === "object" && data.success === true) return true;
+
+  return true;
 };
 
 const fetchPost = async (postId, pageToken) => {
@@ -455,14 +493,25 @@ const resolvePageIdOnce = async (pageToken) => {
   }
 };
 
-// берём задачу с самым ранним dueAt
+const gateAtForType = (type) => {
+  if (type === "like") return nextLikeAllowedAt;
+  return nextReplyAllowedAt;
+};
+
+// берём задачу с самым ранним readyAt = max(dueAt, gateAt)
 const getNextTaskIndex = () => {
   let bestIdx = -1;
-  let bestDue = Infinity;
+  let bestReady = Infinity;
+
+  const now = nowMs();
   for (let i = 0; i < replyQueue.length; i++) {
     const dueAt = Number(replyQueue[i]?.dueAt || 0);
-    if (dueAt < bestDue) {
-      bestDue = dueAt;
+    const type = String(replyQueue[i]?.type || "reply");
+    const gateAt = gateAtForType(type);
+    const readyAt = Math.max(dueAt, gateAt, now);
+
+    if (readyAt < bestReady) {
+      bestReady = readyAt;
       bestIdx = i;
     }
   }
@@ -496,12 +545,11 @@ const scheduleQueueProcessing = () => {
     const now = Date.now();
 
     const dueAt = Number(taskObj.dueAt || 0);
-    const waitForDue = Math.max(0, dueAt - now);
+    const type = String(taskObj.type || "reply");
+    const gateAt = gateAtForType(type);
+    const readyAt = Math.max(dueAt, gateAt);
 
-    const waitForGlobal = Math.max(0, nextReplyAllowedAt - now);
-
-    const waitMs = Math.max(waitForDue, waitForGlobal);
-
+    const waitMs = Math.max(0, readyAt - now);
     if (waitMs > 0) {
       setTimeout(runNext, waitMs);
       return;
@@ -510,15 +558,25 @@ const scheduleQueueProcessing = () => {
     replyQueue.splice(idx, 1);
 
     try {
-      const replied = await taskObj.run();
-      if (replied) {
-        const gap = randInt(BETWEEN_REPLY_MIN_MS, BETWEEN_REPLY_MAX_MS);
-        nextReplyAllowedAt = Date.now() + gap;
+      const did = await taskObj.run();
+      if (did) {
+        if (type === "like") {
+          const gap = randInt(BETWEEN_LIKE_MIN_MS, BETWEEN_LIKE_MAX_MS);
+          nextLikeAllowedAt = Date.now() + gap;
+        } else {
+          const gap = randInt(BETWEEN_REPLY_MIN_MS, BETWEEN_REPLY_MAX_MS);
+          nextReplyAllowedAt = Date.now() + gap;
+        }
       }
     } catch (err) {
       console.error("QUEUE_TASK_ERROR", err);
-      const gap = randInt(BETWEEN_REPLY_MIN_MS, BETWEEN_REPLY_MAX_MS);
-      nextReplyAllowedAt = Date.now() + gap;
+      if (type === "like") {
+        const gap = randInt(BETWEEN_LIKE_MIN_MS, BETWEEN_LIKE_MAX_MS);
+        nextLikeAllowedAt = Date.now() + gap;
+      } else {
+        const gap = randInt(BETWEEN_REPLY_MIN_MS, BETWEEN_REPLY_MAX_MS);
+        nextReplyAllowedAt = Date.now() + gap;
+      }
     } finally {
       setImmediate(runNext);
     }
@@ -584,30 +642,6 @@ app.post("/webhook", (req, res) => {
           const isReply = isReplyEvent(value);
           const threadKey = getThreadKey(value, commentId);
 
-          let webhookMsg = "";
-          let webhookFrom = "";
-
-          if (LOG_WEBHOOK_MESSAGE) {
-            const cached = getCachedComment(commentId);
-            if (cached) {
-              webhookMsg = safeSlice(cached?.message, WEBHOOK_MESSAGE_MAX_CHARS);
-              webhookFrom = String(cached?.from?.name || "");
-            } else {
-              try {
-                const fetched = await fetchComment(commentId, pageToken);
-                setCachedComment(commentId, fetched);
-                webhookMsg = safeSlice(fetched?.message, WEBHOOK_MESSAGE_MAX_CHARS);
-                webhookFrom = String(fetched?.from?.name || "");
-              } catch (err) {
-                logJson("WEBHOOK_MESSAGE_FETCH_FAILED", {
-                  commentId,
-                  postId,
-                  err: String(err).slice(0, 220)
-                });
-              }
-            }
-          }
-
           logWebhookEvent({
             at: ts,
             commentId,
@@ -615,47 +649,33 @@ app.post("/webhook", (req, res) => {
             parentId,
             isReply,
             created_time: value?.created_time || null,
-            queueLen: replyQueue.length,
-            msg: webhookMsg,
-            from: webhookFrom
+            queueLen: replyQueue.length
           });
 
           if (wasProcessed(commentId)) {
-            logSkip("DUPLICATE", { commentId, postId, threadKey, msg: safeSlice(webhookMsg, SKIP_MESSAGE_MAX_CHARS) });
+            logSkip("DUPLICATE", { commentId, postId, threadKey });
             continue;
           }
 
           if (inflight.has(commentId)) {
-            logSkip("INFLIGHT", { commentId, postId, threadKey, msg: safeSlice(webhookMsg, SKIP_MESSAGE_MAX_CHARS) });
+            logSkip("INFLIGHT", { commentId, postId, threadKey });
             continue;
           }
 
           if (!replyToRepliesEnabled() && isReply) {
             rememberComment(commentId);
-            logSkip("REPLY_THREAD_DISABLED", {
-              commentId,
-              postId,
-              threadKey,
-              msg: safeSlice(webhookMsg, SKIP_MESSAGE_MAX_CHARS)
-            });
+            logSkip("REPLY_THREAD_DISABLED", { commentId, postId, threadKey });
             continue;
           }
 
-          // игнор старых, чтобы после рестарта не трогать прошлое
+          // игнор старых
           const createdSec = Number(value?.created_time || 0);
           if (createdSec) {
             const createdMs = createdSec * 1000;
             const ageSec = Math.floor((nowMs() - createdMs) / 1000);
             if (nowMs() - createdMs > IGNORE_OLD_COMMENTS_MIN * 60 * 1000) {
               rememberComment(commentId);
-              logSkip("OLD_COMMENT", {
-                commentId,
-                postId,
-                threadKey,
-                created_time: createdSec,
-                ageSec,
-                msg: safeSlice(webhookMsg, SKIP_MESSAGE_MAX_CHARS)
-              });
+              logSkip("OLD_COMMENT", { commentId, postId, threadKey, created_time: createdSec, ageSec });
               continue;
             }
           }
@@ -665,72 +685,119 @@ app.post("/webhook", (req, res) => {
           const rnd = Math.random();
           if (rnd > prob) {
             rememberComment(commentId);
-            logSkip("PROBABILITY", {
-              commentId,
-              postId,
-              threadKey,
-              isReply,
-              prob,
-              rnd,
-              msg: safeSlice(webhookMsg, SKIP_MESSAGE_MAX_CHARS)
-            });
+            logSkip("PROBABILITY", { commentId, postId, threadKey, isReply, prob, rnd });
             continue;
           }
 
           // лимит по времени
-          if (!canReplyByRate()) {
+          if (!allowReplyByRate()) {
             rememberComment(commentId);
             prune(replyHour, 60 * 60 * 1000);
             prune(replyDay, 24 * 60 * 60 * 1000);
-            logSkip("RATE_LIMIT", {
-              commentId,
-              postId,
-              threadKey,
-              hourCount: replyHour.length,
-              dayCount: replyDay.length,
-              msg: safeSlice(webhookMsg, SKIP_MESSAGE_MAX_CHARS)
-            });
+            logSkip("RATE_LIMIT", { commentId, postId, threadKey, hourCount: replyHour.length, dayCount: replyDay.length });
             continue;
           }
 
           // лимит на ветку
-          pruneThreadReplies();
-          const cur = threadReplies.get(threadKey);
-          const threadCount = Number(cur?.count || 0);
-          if (threadCount >= MAX_BOT_REPLIES_PER_THREAD) {
+          if (!allowReplyInThread(threadKey)) {
             rememberComment(commentId);
-            logSkip("THREAD_LIMIT", {
-              commentId,
-              postId,
-              threadKey,
-              threadCount,
-              msg: safeSlice(webhookMsg, SKIP_MESSAGE_MAX_CHARS)
-            });
+            pruneThreadReplies();
+            const cur = threadReplies.get(threadKey);
+            const threadCount = Number(cur?.count || 0);
+            logSkip("THREAD_LIMIT", { commentId, postId, threadKey, threadCount });
             continue;
           }
 
-          if (replyQueue.length >= MAX_QUEUE_LENGTH) {
+          const tasksToAdd = LIKE_ENABLED ? 2 : 1;
+          if (replyQueue.length + tasksToAdd > MAX_QUEUE_LENGTH) {
             rememberComment(commentId);
-            logSkip("QUEUE_FULL", {
-              commentId,
-              postId,
-              threadKey,
-              queueLen: replyQueue.length,
-              msg: safeSlice(webhookMsg, SKIP_MESSAGE_MAX_CHARS)
-            });
+            logSkip("QUEUE_FULL", { commentId, postId, threadKey, queueLen: replyQueue.length });
+            continue;
+          }
+
+          // подтягиваем комментарий один раз, кладем в кеш, валидируем, и для логов тоже
+          let comment = getCachedComment(commentId);
+          if (!comment) {
+            try {
+              comment = await fetchComment(commentId, pageToken);
+              setCachedComment(commentId, comment);
+            } catch (err) {
+              rememberComment(commentId);
+              logSkip("COMMENT_FETCH_FAILED", { commentId, postId, threadKey, err: String(err).slice(0, 220) });
+              continue;
+            }
+          }
+
+          const msgForLog = safeSlice(comment?.message, WEBHOOK_MESSAGE_MAX_CHARS);
+          const fromForLog = String(comment?.from?.name || "");
+
+          if (LOG_WEBHOOK_MESSAGE) {
+            logJson("WEBHOOK_MESSAGE", { commentId, postId, from: fromForLog, msg: msgForLog });
+          }
+
+          if (pageId && String(comment?.from?.id || "") === pageId) {
+            rememberComment(commentId);
+            logSkip("SELF", { commentId, postId, threadKey, msg: safeSlice(msgForLog, SKIP_MESSAGE_MAX_CHARS) });
+            continue;
+          }
+
+          if (isNoiseOnly(comment?.message)) {
+            rememberComment(commentId);
+            logSkip("NOISE", { commentId, postId, threadKey, msg: safeSlice(msgForLog, SKIP_MESSAGE_MAX_CHARS) });
             continue;
           }
 
           inflight.add(commentId);
 
-          const firstDelay = randInt(FIRST_REPLY_MIN_MS, FIRST_REPLY_MAX_MS);
-          const dueAt = Date.now() + firstDelay;
+          const likeDelay = LIKE_ENABLED ? randInt(LIKE_MIN_MS, LIKE_MAX_MS) : 0;
+
+          const replyDelay = LIKE_ENABLED
+            ? randInt(REPLY_AFTER_LIKE_MIN_MS, REPLY_AFTER_LIKE_MAX_MS)
+            : randInt(FIRST_REPLY_MIN_MS, FIRST_REPLY_MAX_MS);
+
+          const dueLikeAt = Date.now() + likeDelay;
+          const dueReplyAt = Date.now() + likeDelay + replyDelay;
+
+          if (LIKE_ENABLED) {
+            replyQueue.push({
+              type: "like",
+              commentId,
+              postId,
+              threadKey,
+              dueAt: dueLikeAt,
+              run: async () => {
+                if (!isBotEnabled()) return false;
+                if (wasProcessed(commentId)) return false;
+
+                try {
+                  await likeComment(commentId, pageToken);
+                  logJson("LIKED", {
+                    commentId,
+                    postId,
+                    threadKey,
+                    from: LOG_WEBHOOK_MESSAGE ? fromForLog : undefined,
+                    msg: LOG_WEBHOOK_MESSAGE ? safeSlice(msgForLog, SKIP_MESSAGE_MAX_CHARS) : undefined
+                  });
+                  return true;
+                } catch (err) {
+                  logJson("LIKE_FAILED", {
+                    commentId,
+                    postId,
+                    threadKey,
+                    err: String(err).slice(0, 240)
+                  });
+                  return false;
+                }
+              }
+            });
+          }
 
           replyQueue.push({
+            type: "reply",
             commentId,
             postId,
             threadKey,
-            dueAt,
+            dueAt: dueReplyAt,
             run: async () => {
               try {
                 if (!isBotEnabled()) {
@@ -743,29 +810,12 @@ app.post("/webhook", (req, res) => {
                   return false;
                 }
 
-                let comment = getCachedComment(commentId);
-                if (!comment) {
-                  comment = await fetchComment(commentId, pageToken);
-                  setCachedComment(commentId, comment);
-                }
-
-                const msgNow = safeSlice(comment?.message, SKIP_MESSAGE_MAX_CHARS);
-
-                if (pageId && String(comment?.from?.id || "") === pageId) {
-                  rememberComment(commentId);
-                  logSkip("SELF", { commentId, postId, threadKey, msg: msgNow });
-                  return false;
-                }
-
-                if (isNoiseOnly(comment?.message)) {
-                  rememberComment(commentId);
-                  logSkip("NOISE", { commentId, postId, threadKey, msg: msgNow });
-                  return false;
-                }
+                const cached = getCachedComment(commentId);
+                const msgNow = safeSlice(cached?.message || msgForLog, SKIP_MESSAGE_MAX_CHARS);
 
                 const postContext = await getPostContext(postId, pageToken);
 
-                const reply = await generateReply(comment, postContext);
+                const reply = await generateReply(cached || comment, postContext);
                 const posted = await postReply(commentId, reply, pageToken);
 
                 rememberComment(commentId);
@@ -780,11 +830,12 @@ app.post("/webhook", (req, res) => {
                   commentId,
                   postId,
                   threadKey,
-                  firstDelayMs: firstDelay,
-                  msg: msgNow,
+                  likeDelayMs: LIKE_ENABLED ? likeDelay : 0,
+                  replyAfterLikeMs: LIKE_ENABLED ? replyDelay : 0,
+                  msg: LOG_WEBHOOK_MESSAGE ? msgNow : undefined,
                   reply,
                   postedId,
-                  permalink: comment?.permalink_url || ""
+                  permalink: (cached || comment)?.permalink_url || ""
                 });
 
                 return true;
