@@ -42,6 +42,15 @@ const POST_CONTEXT_MAX_CHARS = Number(process.env.POST_CONTEXT_MAX_CHARS || 800)
 const POST_CACHE_TTL_MS = Number(process.env.POST_CACHE_TTL_MS || 10 * 60 * 1000);
 const postCache = new Map();
 
+// логирование webhook и пропусков
+const LOG_WEBHOOK_MESSAGE = String(process.env.LOG_WEBHOOK_MESSAGE || "0").trim() === "1";
+const WEBHOOK_MESSAGE_MAX_CHARS = Number(process.env.WEBHOOK_MESSAGE_MAX_CHARS || 220);
+const SKIP_MESSAGE_MAX_CHARS = Number(process.env.SKIP_MESSAGE_MAX_CHARS || 160);
+
+// кеш комментариев, чтобы не дергать Graph два раза
+const COMMENT_CACHE_TTL_MS = Number(process.env.COMMENT_CACHE_TTL_MS || 2 * 60 * 1000);
+const commentCache = new Map();
+
 const replyHour = [];
 const replyDay = [];
 const threadReplies = new Map();
@@ -53,6 +62,29 @@ const isBotEnabled = () => String(process.env.BOT_ENABLED || "").trim() === "1";
 const replyToRepliesEnabled = () => String(process.env.REPLY_TO_REPLIES || "1").trim() === "1";
 
 const nowMs = () => Date.now();
+
+const safeSlice = (s, n) => {
+  const t = String(s || "");
+  if (!n || n <= 0) return "";
+  if (t.length <= n) return t;
+  return t.slice(0, n).replace(/\s+/g, " ").trim();
+};
+
+const logJson = (tag, obj) => {
+  try {
+    console.log(tag, JSON.stringify(obj));
+  } catch (e) {
+    console.log(tag, String(e));
+  }
+};
+
+const logWebhookEvent = (meta) => {
+  logJson("WEBHOOK_EVENT", meta || {});
+};
+
+const logSkip = (reason, meta) => {
+  logJson("SKIP", { reason, ...(meta || {}) });
+};
 
 const randInt = (min, max) => {
   const a = Number(min);
@@ -120,13 +152,6 @@ const normalize = (s) =>
     .replace(/\s+/g, " ")
     .trim();
 
-const safeSlice = (s, n) => {
-  const t = String(s || "");
-  if (!n || n <= 0) return "";
-  if (t.length <= n) return t;
-  return t.slice(0, n).trim();
-};
-
 const isNoiseOnly = (msg) => {
   const m = normalize(msg);
   if (!m) return true;
@@ -149,6 +174,29 @@ const isReplyEvent = (value) => {
   const parentId = String(value?.parent_id || "");
   if (!postId || !parentId) return false;
   return parentId !== postId;
+};
+
+const pruneCommentCache = () => {
+  const cutoff = nowMs() - COMMENT_CACHE_TTL_MS;
+  for (const [k, v] of commentCache.entries()) {
+    if (!v || v.ts < cutoff) commentCache.delete(k);
+  }
+};
+
+const getCachedComment = (commentId) => {
+  pruneCommentCache();
+  const v = commentCache.get(commentId);
+  if (!v) return null;
+  if (nowMs() - v.ts > COMMENT_CACHE_TTL_MS) {
+    commentCache.delete(commentId);
+    return null;
+  }
+  return v.comment || null;
+};
+
+const setCachedComment = (commentId, comment) => {
+  pruneCommentCache();
+  commentCache.set(commentId, { ts: nowMs(), comment });
 };
 
 const fetchComment = async (commentId, pageToken) => {
@@ -499,7 +547,8 @@ const extractCommentId = (v) => {
 };
 
 app.post("/webhook", (req, res) => {
-  console.log("WEBHOOK IN", new Date().toISOString());
+  const ts = new Date().toISOString();
+  console.log("WEBHOOK IN", ts);
   res.sendStatus(200);
 
   setImmediate(async () => {
@@ -531,21 +580,64 @@ app.post("/webhook", (req, res) => {
           if (!commentId) continue;
 
           const postId = String(value?.post_id || "").trim();
+          const parentId = String(value?.parent_id || "").trim();
+          const isReply = isReplyEvent(value);
           const threadKey = getThreadKey(value, commentId);
 
+          let webhookMsg = "";
+          let webhookFrom = "";
+
+          if (LOG_WEBHOOK_MESSAGE) {
+            const cached = getCachedComment(commentId);
+            if (cached) {
+              webhookMsg = safeSlice(cached?.message, WEBHOOK_MESSAGE_MAX_CHARS);
+              webhookFrom = String(cached?.from?.name || "");
+            } else {
+              try {
+                const fetched = await fetchComment(commentId, pageToken);
+                setCachedComment(commentId, fetched);
+                webhookMsg = safeSlice(fetched?.message, WEBHOOK_MESSAGE_MAX_CHARS);
+                webhookFrom = String(fetched?.from?.name || "");
+              } catch (err) {
+                logJson("WEBHOOK_MESSAGE_FETCH_FAILED", {
+                  commentId,
+                  postId,
+                  err: String(err).slice(0, 220)
+                });
+              }
+            }
+          }
+
+          logWebhookEvent({
+            at: ts,
+            commentId,
+            postId,
+            parentId,
+            isReply,
+            created_time: value?.created_time || null,
+            queueLen: replyQueue.length,
+            msg: webhookMsg,
+            from: webhookFrom
+          });
+
           if (wasProcessed(commentId)) {
-            console.log("SKIP_DUPLICATE", commentId);
+            logSkip("DUPLICATE", { commentId, postId, threadKey, msg: safeSlice(webhookMsg, SKIP_MESSAGE_MAX_CHARS) });
             continue;
           }
 
           if (inflight.has(commentId)) {
-            console.log("SKIP_INFLIGHT", commentId);
+            logSkip("INFLIGHT", { commentId, postId, threadKey, msg: safeSlice(webhookMsg, SKIP_MESSAGE_MAX_CHARS) });
             continue;
           }
 
-          if (!replyToRepliesEnabled() && isReplyEvent(value)) {
+          if (!replyToRepliesEnabled() && isReply) {
             rememberComment(commentId);
-            console.log("SKIP_REPLY_THREAD", commentId);
+            logSkip("REPLY_THREAD_DISABLED", {
+              commentId,
+              postId,
+              threadKey,
+              msg: safeSlice(webhookMsg, SKIP_MESSAGE_MAX_CHARS)
+            });
             continue;
           }
 
@@ -553,39 +645,79 @@ app.post("/webhook", (req, res) => {
           const createdSec = Number(value?.created_time || 0);
           if (createdSec) {
             const createdMs = createdSec * 1000;
+            const ageSec = Math.floor((nowMs() - createdMs) / 1000);
             if (nowMs() - createdMs > IGNORE_OLD_COMMENTS_MIN * 60 * 1000) {
               rememberComment(commentId);
-              console.log("SKIP_OLD_COMMENT", commentId);
+              logSkip("OLD_COMMENT", {
+                commentId,
+                postId,
+                threadKey,
+                created_time: createdSec,
+                ageSec,
+                msg: safeSlice(webhookMsg, SKIP_MESSAGE_MAX_CHARS)
+              });
               continue;
             }
           }
 
           // вероятность ответа
-          const isReply = isReplyEvent(value);
           const prob = isReply ? REPLY_PROB_REPLY : REPLY_PROB_TOP;
-          if (Math.random() > prob) {
+          const rnd = Math.random();
+          if (rnd > prob) {
             rememberComment(commentId);
-            console.log("SKIP_PROBABILITY", commentId);
+            logSkip("PROBABILITY", {
+              commentId,
+              postId,
+              threadKey,
+              isReply,
+              prob,
+              rnd,
+              msg: safeSlice(webhookMsg, SKIP_MESSAGE_MAX_CHARS)
+            });
             continue;
           }
 
           // лимит по времени
           if (!canReplyByRate()) {
             rememberComment(commentId);
-            console.log("SKIP_RATE_LIMIT", commentId);
+            prune(replyHour, 60 * 60 * 1000);
+            prune(replyDay, 24 * 60 * 60 * 1000);
+            logSkip("RATE_LIMIT", {
+              commentId,
+              postId,
+              threadKey,
+              hourCount: replyHour.length,
+              dayCount: replyDay.length,
+              msg: safeSlice(webhookMsg, SKIP_MESSAGE_MAX_CHARS)
+            });
             continue;
           }
 
           // лимит на ветку
-          if (!canReplyInThread(threadKey)) {
+          pruneThreadReplies();
+          const cur = threadReplies.get(threadKey);
+          const threadCount = Number(cur?.count || 0);
+          if (threadCount >= MAX_BOT_REPLIES_PER_THREAD) {
             rememberComment(commentId);
-            console.log("SKIP_THREAD_LIMIT", commentId, "thread=" + threadKey);
+            logSkip("THREAD_LIMIT", {
+              commentId,
+              postId,
+              threadKey,
+              threadCount,
+              msg: safeSlice(webhookMsg, SKIP_MESSAGE_MAX_CHARS)
+            });
             continue;
           }
 
           if (replyQueue.length >= MAX_QUEUE_LENGTH) {
             rememberComment(commentId);
-            console.log("RATE_LIMIT_SKIP", commentId);
+            logSkip("QUEUE_FULL", {
+              commentId,
+              postId,
+              threadKey,
+              queueLen: replyQueue.length,
+              msg: safeSlice(webhookMsg, SKIP_MESSAGE_MAX_CHARS)
+            });
             continue;
           }
 
@@ -596,30 +728,38 @@ app.post("/webhook", (req, res) => {
 
           replyQueue.push({
             commentId,
+            postId,
+            threadKey,
             dueAt,
             run: async () => {
               try {
                 if (!isBotEnabled()) {
-                  console.log("BOT_DISABLED_DROP", commentId);
+                  logSkip("BOT_DISABLED_DROP", { commentId, postId, threadKey });
                   return false;
                 }
 
                 if (wasProcessed(commentId)) {
-                  console.log("SKIP_DUPLICATE_LATE", commentId);
+                  logSkip("DUPLICATE_LATE", { commentId, postId, threadKey });
                   return false;
                 }
 
-                const comment = await fetchComment(commentId, pageToken);
+                let comment = getCachedComment(commentId);
+                if (!comment) {
+                  comment = await fetchComment(commentId, pageToken);
+                  setCachedComment(commentId, comment);
+                }
+
+                const msgNow = safeSlice(comment?.message, SKIP_MESSAGE_MAX_CHARS);
 
                 if (pageId && String(comment?.from?.id || "") === pageId) {
                   rememberComment(commentId);
-                  console.log("SKIP_SELF", commentId);
+                  logSkip("SELF", { commentId, postId, threadKey, msg: msgNow });
                   return false;
                 }
 
                 if (isNoiseOnly(comment?.message)) {
                   rememberComment(commentId);
-                  console.log("SKIP_NOISE", commentId);
+                  logSkip("NOISE", { commentId, postId, threadKey, msg: msgNow });
                   return false;
                 }
 
@@ -636,15 +776,17 @@ app.post("/webhook", (req, res) => {
                 markReply();
                 markThreadReply(threadKey);
 
-                console.log(
-                  "REPLIED",
-                  comment?.permalink_url || commentId,
-                  "thread=" + threadKey,
-                  "post=" + (postId || "-"),
-                  "firstDelayMs=" + firstDelay,
+                logJson("REPLIED", {
+                  commentId,
+                  postId,
+                  threadKey,
+                  firstDelayMs: firstDelay,
+                  msg: msgNow,
                   reply,
-                  postedId
-                );
+                  postedId,
+                  permalink: comment?.permalink_url || ""
+                });
+
                 return true;
               } finally {
                 inflight.delete(commentId);
