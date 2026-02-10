@@ -37,6 +37,11 @@ const REPLY_PROB_REPLY = Number(process.env.REPLY_PROB_REPLY || 0.7);
 
 const IGNORE_OLD_COMMENTS_MIN = Number(process.env.IGNORE_OLD_COMMENTS_MIN || 5);
 
+// контекст поста
+const POST_CONTEXT_MAX_CHARS = Number(process.env.POST_CONTEXT_MAX_CHARS || 800);
+const POST_CACHE_TTL_MS = Number(process.env.POST_CACHE_TTL_MS || 10 * 60 * 1000);
+const postCache = new Map();
+
 const replyHour = [];
 const replyDay = [];
 const threadReplies = new Map();
@@ -115,6 +120,13 @@ const normalize = (s) =>
     .replace(/\s+/g, " ")
     .trim();
 
+const safeSlice = (s, n) => {
+  const t = String(s || "");
+  if (!n || n <= 0) return "";
+  if (t.length <= n) return t;
+  return t.slice(0, n).trim();
+};
+
 const isNoiseOnly = (msg) => {
   const m = normalize(msg);
   if (!m) return true;
@@ -125,7 +137,7 @@ const isNoiseOnly = (msg) => {
 
   const low = m.toLowerCase();
   const words = low.split(/\s+/).filter(Boolean);
-  const fillers = new Set(["ok", "okay", "nice", "wow", "cool", "lol", "thanks", "thx", "great", "good"]);
+  const fillers = new Set(["ok", "okay", "nice", "wow", "cool", "lol", "thanks", "thx", "great", "good", "gg"]);
   if (words.length === 1 && fillers.has(words[0])) return true;
 
   return false;
@@ -141,7 +153,10 @@ const isReplyEvent = (value) => {
 
 const fetchComment = async (commentId, pageToken) => {
   const url = new URL(`${GRAPH_API_BASE}/${commentId}`);
-  url.searchParams.set("fields", "message,from{id,name},permalink_url");
+  url.searchParams.set(
+    "fields",
+    "message,from{id,name},permalink_url,created_time,parent{id,message,from{id,name}}"
+  );
   url.searchParams.set("access_token", pageToken);
 
   const r = await fetch(url.toString());
@@ -152,23 +167,111 @@ const fetchComment = async (commentId, pageToken) => {
   return r.json();
 };
 
-const buildPrompt = (comment) => {
-  const text = normalize(comment?.message);
+const fetchPost = async (postId, pageToken) => {
+  if (!postId) return null;
 
-  return [
+  const url = new URL(`${GRAPH_API_BASE}/${postId}`);
+  url.searchParams.set(
+    "fields",
+    [
+      "message",
+      "story",
+      "permalink_url",
+      "created_time",
+      "attachments{media_type,title,description,url}"
+    ].join(",")
+  );
+  url.searchParams.set("access_token", pageToken);
+
+  const r = await fetch(url.toString());
+  if (!r.ok) {
+    const t = await r.text();
+    throw new Error(`Fetch post failed ${r.status}: ${t}`);
+  }
+  return r.json();
+};
+
+const buildPostContext = (post) => {
+  if (!post) return "";
+
+  const parts = [];
+
+  const msg = normalize(post?.message);
+  const story = normalize(post?.story);
+
+  if (msg) parts.push(`Post caption: "${msg}"`);
+  else if (story) parts.push(`Post text: "${story}"`);
+
+  const att = post?.attachments?.data;
+  if (Array.isArray(att) && att.length) {
+    const a = att[0];
+    const t = normalize(a?.title);
+    const d = normalize(a?.description);
+    const mt = normalize(a?.media_type);
+
+    if (mt) parts.push(`Attachment type: ${mt}`);
+    if (t) parts.push(`Attachment title: "${t}"`);
+    if (d) parts.push(`Attachment description: "${d}"`);
+  }
+
+  const out = parts.join("\n");
+  return safeSlice(out, POST_CONTEXT_MAX_CHARS);
+};
+
+const getPostContext = async (postId, pageToken) => {
+  if (!postId) return "";
+
+  const cached = postCache.get(postId);
+  const now = nowMs();
+
+  if (cached && now - cached.ts < POST_CACHE_TTL_MS) return cached.text || "";
+
+  try {
+    const post = await fetchPost(postId, pageToken);
+    const text = buildPostContext(post);
+    postCache.set(postId, { ts: now, text });
+    return text;
+  } catch (e) {
+    postCache.set(postId, { ts: now, text: "" });
+    console.log("POST_CONTEXT_FETCH_FAILED", postId, String(e).slice(0, 300));
+    return "";
+  }
+};
+
+const buildPrompt = (comment, postContext) => {
+  const text = normalize(comment?.message);
+  const parentMsg = normalize(comment?.parent?.message);
+  const ctx = normalize(postContext);
+
+  const lines = [
     "You are a friendly admin replying to a Facebook Page comment.",
     "Reply ONLY in English.",
     "Write 1 to 2 short sentences total.",
     "Friendly, helpful, natural tone.",
     "No hashtags. Do not mention AI, bots, or policies.",
+    "Use the post context below. Keep your reply aligned with what the video/post is about.",
     "End with EXACTLY ONE specific question that encourages a reply.",
-    "Prefer choice questions, experience questions, or quick clarifications.",
-    "If the user asked a question, answer briefly and ask a clarifying question.",
-    "If they say they will try it or thank you, ask about results or timing.",
-    "If they express doubt, ask what seems off or which version they use.",
-    "",
-    `User comment: "${text}"`
-  ].join("\n");
+    "Ask a question that matches the post topic and the user comment, not generic app or version questions.",
+    "If the user asked a question, answer briefly and ask one clarifying question about their case.",
+    "If they say they will try it or thank you, ask about results or timing related to the post topic.",
+    "If they express doubt, ask what part seems wrong or what exactly they tried.",
+    ""
+  ];
+
+  if (ctx) {
+    lines.push("Post context:");
+    lines.push(ctx);
+    lines.push("");
+  }
+
+  if (parentMsg) {
+    lines.push(`Parent comment in the thread: "${parentMsg}"`);
+    lines.push("");
+  }
+
+  lines.push(`User comment: "${text}"`);
+
+  return lines.join("\n");
 };
 
 const extractOpenAiText = (data) => {
@@ -222,7 +325,7 @@ const callOpenAi = async (input, temperature = 0.7) => {
       model,
       input,
       temperature,
-      max_output_tokens: 120
+      max_output_tokens: 140
     })
   });
 
@@ -235,8 +338,8 @@ const callOpenAi = async (input, temperature = 0.7) => {
   return extractOpenAiText(data);
 };
 
-const generateReply = async (comment) => {
-  const first = trimReply(await callOpenAi(buildPrompt(comment), 0.7));
+const generateReply = async (comment, postContext) => {
+  const first = trimReply(await callOpenAi(buildPrompt(comment, postContext), 0.7));
   if (!first) throw new Error("Empty OpenAI reply");
 
   if (!looksNotEnglish(first)) return first;
@@ -427,6 +530,9 @@ app.post("/webhook", (req, res) => {
           const commentId = extractCommentId(value);
           if (!commentId) continue;
 
+          const postId = String(value?.post_id || "").trim();
+          const threadKey = getThreadKey(value, commentId);
+
           if (wasProcessed(commentId)) {
             console.log("SKIP_DUPLICATE", commentId);
             continue;
@@ -471,10 +577,9 @@ app.post("/webhook", (req, res) => {
           }
 
           // лимит на ветку
-          const threadKey = getThreadKey(value, commentId);
           if (!canReplyInThread(threadKey)) {
             rememberComment(commentId);
-            console.log("SKIP_THREAD_LIMIT", commentId);
+            console.log("SKIP_THREAD_LIMIT", commentId, "thread=" + threadKey);
             continue;
           }
 
@@ -518,7 +623,9 @@ app.post("/webhook", (req, res) => {
                   return false;
                 }
 
-                const reply = await generateReply(comment);
+                const postContext = await getPostContext(postId, pageToken);
+
+                const reply = await generateReply(comment, postContext);
                 const posted = await postReply(commentId, reply, pageToken);
 
                 rememberComment(commentId);
@@ -533,6 +640,7 @@ app.post("/webhook", (req, res) => {
                   "REPLIED",
                   comment?.permalink_url || commentId,
                   "thread=" + threadKey,
+                  "post=" + (postId || "-"),
                   "firstDelayMs=" + firstDelay,
                   reply,
                   postedId
