@@ -1,4 +1,4 @@
-console.log("SERVER VERSION 2026-02-11 WEBHOOK PROD FIX1");
+console.log("SERVER VERSION 2026-02-11 WEBHOOK PROD FIX2");
 
 const express = require("express");
 const fetch = require("node-fetch");
@@ -74,7 +74,13 @@ const inflight = new Set();
 // BAIT COMMENT (для закрепа)
 const BAIT_ENABLED = String(process.env.BAIT_ENABLED || "1").trim() === "1";
 const BAIT_ON_NEW_POST = String(process.env.BAIT_ON_NEW_POST || "1").trim() === "1";
-const BAIT_ON_FIRST_COMMENT = String(process.env.BAIT_ON_FIRST_COMMENT || "1").trim() === "1";
+
+// ВАЖНО: по умолчанию выключаем BAIT на первый коммент
+const BAIT_ON_FIRST_COMMENT = String(process.env.BAIT_ON_FIRST_COMMENT || "0").trim() === "1";
+
+// Окно “свежего поста” для first_comment_fallback, в минутах
+const BAIT_FRESH_POST_WINDOW_MIN = Number(process.env.BAIT_FRESH_POST_WINDOW_MIN || 120);
+
 const BAIT_DELAY_MIN_MS = Number(process.env.BAIT_DELAY_MIN_MS || 1500);
 const BAIT_DELAY_MAX_MS = Number(process.env.BAIT_DELAY_MAX_MS || 4000);
 const BAIT_CACHE_TTL_MS = Number(process.env.BAIT_CACHE_TTL_MS || 7 * 24 * 60 * 60 * 1000);
@@ -82,6 +88,10 @@ const BAIT_MAX_CHARS = Number(process.env.BAIT_MAX_CHARS || 220);
 
 const baitCache = new Map(); // postId -> { ts, commentId, text }
 const baitInflight = new Set(); // postId
+
+// кеш меты поста (created_time), чтобы не дергать Graph на каждый коммент
+const POST_META_TTL_MS = Number(process.env.POST_META_TTL_MS || 10 * 60 * 1000);
+const postMetaCache = new Map(); // postId -> { ts, createdMs, published }
 
 // BAIT на "новый пост" только для реальных публикаций
 const NEW_POST_ITEMS = new Set(["post", "video", "photo"]);
@@ -346,6 +356,44 @@ const fetchPost = async (postId, pageToken) => {
     throw new Error(`Fetch post failed ${r.status}: ${t}`);
   }
   return r.json();
+};
+
+const fetchPostMeta = async (postId, pageToken) => {
+  if (!postId) return null;
+
+  const url = new URL(`${GRAPH_API_BASE}/${postId}`);
+  url.searchParams.set("fields", "created_time,published");
+  url.searchParams.set("access_token", pageToken);
+
+  const r = await fetch(url.toString());
+  if (!r.ok) return null;
+  return r.json();
+};
+
+const prunePostMetaCache = () => {
+  const cutoff = nowMs() - POST_META_TTL_MS;
+  for (const [k, v] of postMetaCache.entries()) {
+    if (!v || v.ts < cutoff) postMetaCache.delete(k);
+  }
+};
+
+const getPostMeta = async (postId, pageToken) => {
+  prunePostMetaCache();
+  const cached = postMetaCache.get(postId);
+  if (cached && nowMs() - cached.ts < POST_META_TTL_MS) return cached;
+
+  try {
+    const meta = await fetchPostMeta(postId, pageToken);
+    const createdMs = Date.parse(meta?.created_time || "") || 0;
+    const published = Number(meta?.published ?? 1);
+    const out = { ts: nowMs(), createdMs, published };
+    postMetaCache.set(postId, out);
+    return out;
+  } catch (_) {
+    const out = { ts: nowMs(), createdMs: 0, published: 1 };
+    postMetaCache.set(postId, out);
+    return out;
+  }
 };
 
 const buildPostContext = (post) => {
@@ -915,55 +963,8 @@ const extractPostId = (v) => {
 
 app.post("/webhook", (req, res) => {
   const ts = new Date().toISOString();
-
-  const entries = Array.isArray(req.body?.entry) ? req.body.entry : [];
-
-  let feedCount = 0;
-  let commentAddCount = 0;
-  let newPostAddCount = 0;
-
-  for (const e of entries) {
-    const changes = Array.isArray(e?.changes) ? e.changes : [];
-    for (const c of changes) {
-      if (c?.field !== "feed") continue;
-      feedCount++;
-
-      const value = c?.value || {};
-      const item = String(value?.item || "").trim();
-      const verb = String(value?.verb || "").trim();
-
-      if (item === "comment" && verb === "add") commentAddCount++;
-
-      const postId = String(extractPostId(value) || "").trim();
-      if (
-        BAIT_ENABLED &&
-        BAIT_ON_NEW_POST &&
-        verb === "add" &&
-        postId &&
-        NEW_POST_ITEMS.has(item) &&
-        Number(value?.published ?? 1) === 1
-      ) {
-        newPostAddCount++;
-      }
-    }
-  }
-
+  console.log("WEBHOOK IN", ts);
   res.sendStatus(200);
-
-  if (feedCount && (commentAddCount || newPostAddCount)) {
-    console.log(
-      "WEBHOOK IN",
-      ts,
-      "feed=",
-      feedCount,
-      "comments=",
-      commentAddCount,
-      "newPosts=",
-      newPostAddCount
-    );
-  }
-
-  if (!feedCount) return;
 
   setImmediate(async () => {
     try {
@@ -972,6 +973,7 @@ app.post("/webhook", (req, res) => {
         return;
       }
 
+      const entries = Array.isArray(req.body?.entry) ? req.body.entry : [];
       if (!entries.length) return;
 
       const pageToken = process.env.FB_PAGE_TOKEN;
@@ -1133,9 +1135,22 @@ app.post("/webhook", (req, res) => {
             continue;
           }
 
-          // BAIT на первый живой коммент, не на self и не на noise
+          // BAIT на первый живой коммент, но только если пост свежий
           if (BAIT_ENABLED && BAIT_ON_FIRST_COMMENT && postId) {
-            await ensureBaitForPost(postId, pageToken, ts, "first_comment_fallback");
+            const meta = await getPostMeta(postId, pageToken);
+            const createdMs = Number(meta?.createdMs || 0);
+            const published = Number(meta?.published ?? 1);
+
+            if (published === 1 && createdMs) {
+              const ageMin = Math.floor((nowMs() - createdMs) / 60000);
+              if (ageMin <= BAIT_FRESH_POST_WINDOW_MIN) {
+                await ensureBaitForPost(postId, pageToken, ts, "first_comment_fallback");
+              } else {
+                logSkip("BAIT_OLD_POST_FIRST_COMMENT", { postId, ageMin, windowMin: BAIT_FRESH_POST_WINDOW_MIN });
+              }
+            } else {
+              logSkip("BAIT_META_MISSING_OR_UNPUBLISHED", { postId });
+            }
           }
 
           inflight.add(commentId);
