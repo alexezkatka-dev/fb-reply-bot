@@ -915,8 +915,55 @@ const extractPostId = (v) => {
 
 app.post("/webhook", (req, res) => {
   const ts = new Date().toISOString();
-  console.log("WEBHOOK IN", ts);
+
+  const entries = Array.isArray(req.body?.entry) ? req.body.entry : [];
+
+  let feedCount = 0;
+  let commentAddCount = 0;
+  let newPostAddCount = 0;
+
+  for (const e of entries) {
+    const changes = Array.isArray(e?.changes) ? e.changes : [];
+    for (const c of changes) {
+      if (c?.field !== "feed") continue;
+      feedCount++;
+
+      const value = c?.value || {};
+      const item = String(value?.item || "").trim();
+      const verb = String(value?.verb || "").trim();
+
+      if (item === "comment" && verb === "add") commentAddCount++;
+
+      const postId = String(extractPostId(value) || "").trim();
+      if (
+        BAIT_ENABLED &&
+        BAIT_ON_NEW_POST &&
+        verb === "add" &&
+        postId &&
+        NEW_POST_ITEMS.has(item) &&
+        Number(value?.published ?? 1) === 1
+      ) {
+        newPostAddCount++;
+      }
+    }
+  }
+
   res.sendStatus(200);
+
+  if (feedCount && (commentAddCount || newPostAddCount)) {
+    console.log(
+      "WEBHOOK IN",
+      ts,
+      "feed=",
+      feedCount,
+      "comments=",
+      commentAddCount,
+      "newPosts=",
+      newPostAddCount
+    );
+  }
+
+  if (!feedCount) return;
 
   setImmediate(async () => {
     try {
@@ -925,7 +972,6 @@ app.post("/webhook", (req, res) => {
         return;
       }
 
-      const entries = Array.isArray(req.body?.entry) ? req.body.entry : [];
       if (!entries.length) return;
 
       const pageToken = process.env.FB_PAGE_TOKEN;
