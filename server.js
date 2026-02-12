@@ -1,462 +1,560 @@
-console.log("SERVER VERSION 2026-02-11 WEBHOOK PROD FIX2");
+console.log("SERVER VERSION 2026-02-11 WEBHOOK PROD FIX2 MULTIPAGE LANG LOGS")
 
-const express = require("express");
-const fetch = require("node-fetch");
+const express = require("express")
+const fetch = require("node-fetch")
 
-const app = express();
-app.use(express.json({ limit: "2mb" }));
+const app = express()
+app.use(express.json({ limit: "2mb" }))
 
-const GRAPH_API_VERSION = process.env.GRAPH_API_VERSION || "v19.0";
-const GRAPH_API_BASE = `https://graph.facebook.com/${GRAPH_API_VERSION}`;
+const GRAPH_API_VERSION = process.env.GRAPH_API_VERSION || "v19.0"
+const GRAPH_API_BASE = `https://graph.facebook.com/${GRAPH_API_VERSION}`
 
-const MAX_PROCESSED = 5000;
-const processedComments = new Map();
+const nowMs = () => Date.now()
 
-// очередь: задачи с временем, когда их разрешено выполнять
-const replyQueue = [];
-let processingQueue = false;
+const isOne = (v) => String(v || "").trim() === "1"
+const envBool = (name, def0or1) => {
+  const raw = String(process.env[name] ?? "").trim()
+  if (!raw) return def0or1 === 1
+  return raw === "1" || raw.toLowerCase() === "true"
+}
 
-// глобальная защита “между ответами”
-let nextReplyAllowedAt = 0;
-// глобальная защита “между лайками”
-let nextLikeAllowedAt = 0;
+const LOG_WEBHOOK_IN = envBool("LOG_WEBHOOK_IN", 0)
+const LOG_WEBHOOK_EVENTS = envBool("LOG_WEBHOOK_EVENTS", 0)
+const LOG_SKIPS = envBool("LOG_SKIPS", 0)
+const LOG_WEBHOOK_MESSAGE = envBool("LOG_WEBHOOK_MESSAGE", 0)
+const LOG_ONLY_MESSAGE_EVENTS = envBool("LOG_ONLY_MESSAGE_EVENTS", 1)
 
-const MAX_QUEUE_LENGTH = Number(process.env.MAX_QUEUE_LENGTH || 20);
+const WEBHOOK_MESSAGE_MAX_CHARS = Number(process.env.WEBHOOK_MESSAGE_MAX_CHARS || 220)
+const SKIP_MESSAGE_MAX_CHARS = Number(process.env.SKIP_MESSAGE_MAX_CHARS || 160)
 
-const FIRST_REPLY_MIN_MS = Number(process.env.FIRST_REPLY_MIN_MS || 20000);
-const FIRST_REPLY_MAX_MS = Number(process.env.FIRST_REPLY_MAX_MS || 30000);
+const MAX_QUEUE_LENGTH = Number(process.env.MAX_QUEUE_LENGTH || 20)
 
-const BETWEEN_REPLY_MIN_MS = Number(process.env.BETWEEN_REPLY_MIN_MS || 15000);
-const BETWEEN_REPLY_MAX_MS = Number(process.env.BETWEEN_REPLY_MAX_MS || 45000);
+const FIRST_REPLY_MIN_MS = Number(process.env.FIRST_REPLY_MIN_MS || 20000)
+const FIRST_REPLY_MAX_MS = Number(process.env.FIRST_REPLY_MAX_MS || 30000)
 
-// лайк перед ответом
-const LIKE_ENABLED = String(process.env.LIKE_ENABLED || "1").trim() === "1";
-const LIKE_MIN_MS = Number(process.env.LIKE_MIN_MS || 0);
-const LIKE_MAX_MS = Number(process.env.LIKE_MAX_MS || 3000);
+const BETWEEN_REPLY_MIN_MS = Number(process.env.BETWEEN_REPLY_MIN_MS || 15000)
+const BETWEEN_REPLY_MAX_MS = Number(process.env.BETWEEN_REPLY_MAX_MS || 45000)
 
-const REPLY_AFTER_LIKE_MIN_MS = Number(process.env.REPLY_AFTER_LIKE_MIN_MS || 25000);
-const REPLY_AFTER_LIKE_MAX_MS = Number(process.env.REPLY_AFTER_LIKE_MAX_MS || 60000);
+const LIKE_ENABLED = isOne(process.env.LIKE_ENABLED || "1")
+const LIKE_MIN_MS = Number(process.env.LIKE_MIN_MS || 0)
+const LIKE_MAX_MS = Number(process.env.LIKE_MAX_MS || 3000)
 
-const BETWEEN_LIKE_MIN_MS = Number(process.env.BETWEEN_LIKE_MIN_MS || 2000);
-const BETWEEN_LIKE_MAX_MS = Number(process.env.BETWEEN_LIKE_MAX_MS || 8000);
+const REPLY_AFTER_LIKE_MIN_MS = Number(process.env.REPLY_AFTER_LIKE_MIN_MS || 25000)
+const REPLY_AFTER_LIKE_MAX_MS = Number(process.env.REPLY_AFTER_LIKE_MAX_MS || 60000)
 
-// лимиты и вероятности
-const MAX_REPLIES_PER_HOUR = Number(process.env.MAX_REPLIES_PER_HOUR || 40);
-const MAX_REPLIES_PER_DAY = Number(process.env.MAX_REPLIES_PER_DAY || 300);
-const MAX_BOT_REPLIES_PER_THREAD = Number(process.env.MAX_BOT_REPLIES_PER_THREAD || 3);
+const BETWEEN_LIKE_MIN_MS = Number(process.env.BETWEEN_LIKE_MIN_MS || 2000)
+const BETWEEN_LIKE_MAX_MS = Number(process.env.BETWEEN_LIKE_MAX_MS || 8000)
 
-// по умолчанию отвечаем на все, можно опустить через env
-const REPLY_PROB_TOP = Number(process.env.REPLY_PROB_TOP || 1);
-const REPLY_PROB_REPLY = Number(process.env.REPLY_PROB_REPLY || 1);
+const MAX_REPLIES_PER_HOUR = Number(process.env.MAX_REPLIES_PER_HOUR || 40)
+const MAX_REPLIES_PER_DAY = Number(process.env.MAX_REPLIES_PER_DAY || 300)
+const MAX_BOT_REPLIES_PER_THREAD = Number(process.env.MAX_BOT_REPLIES_PER_THREAD || 3)
 
-const IGNORE_OLD_COMMENTS_MIN = Number(process.env.IGNORE_OLD_COMMENTS_MIN || 5);
+const REPLY_PROB_TOP = Number(process.env.REPLY_PROB_TOP || 1)
+const REPLY_PROB_REPLY = Number(process.env.REPLY_PROB_REPLY || 1)
 
-// контекст поста
-const POST_CONTEXT_MAX_CHARS = Number(process.env.POST_CONTEXT_MAX_CHARS || 800);
-const POST_CACHE_TTL_MS = Number(process.env.POST_CACHE_TTL_MS || 10 * 60 * 1000);
-const postCache = new Map();
+const IGNORE_OLD_COMMENTS_MIN = Number(process.env.IGNORE_OLD_COMMENTS_MIN || 5)
 
-// логирование webhook и пропусков
-const LOG_WEBHOOK_MESSAGE = String(process.env.LOG_WEBHOOK_MESSAGE || "0").trim() === "1";
-const WEBHOOK_MESSAGE_MAX_CHARS = Number(process.env.WEBHOOK_MESSAGE_MAX_CHARS || 220);
-const SKIP_MESSAGE_MAX_CHARS = Number(process.env.SKIP_MESSAGE_MAX_CHARS || 160);
+const POST_CONTEXT_MAX_CHARS = Number(process.env.POST_CONTEXT_MAX_CHARS || 800)
+const POST_CACHE_TTL_MS = Number(process.env.POST_CACHE_TTL_MS || 10 * 60 * 1000)
 
-// кеш комментариев, чтобы не дергать Graph два раза
-const COMMENT_CACHE_TTL_MS = Number(process.env.COMMENT_CACHE_TTL_MS || 2 * 60 * 1000);
-const commentCache = new Map();
+const COMMENT_CACHE_TTL_MS = Number(process.env.COMMENT_CACHE_TTL_MS || 2 * 60 * 1000)
 
-const replyHour = [];
-const replyDay = [];
-const threadReplies = new Map();
+const BAIT_ENABLED = isOne(process.env.BAIT_ENABLED || "1")
+const BAIT_ON_NEW_POST = isOne(process.env.BAIT_ON_NEW_POST || "1")
+const BAIT_ON_FIRST_COMMENT = isOne(process.env.BAIT_ON_FIRST_COMMENT || "0")
+const BAIT_FRESH_POST_WINDOW_MIN = Number(process.env.BAIT_FRESH_POST_WINDOW_MIN || 120)
 
-const inflight = new Set();
+const BAIT_DELAY_MIN_MS = Number(process.env.BAIT_DELAY_MIN_MS || 1500)
+const BAIT_DELAY_MAX_MS = Number(process.env.BAIT_DELAY_MAX_MS || 4000)
+const BAIT_CACHE_TTL_MS = Number(process.env.BAIT_CACHE_TTL_MS || 7 * 24 * 60 * 60 * 1000)
+const BAIT_MAX_CHARS = Number(process.env.BAIT_MAX_CHARS || 220)
 
-// BAIT COMMENT (для закрепа)
-const BAIT_ENABLED = String(process.env.BAIT_ENABLED || "1").trim() === "1";
-const BAIT_ON_NEW_POST = String(process.env.BAIT_ON_NEW_POST || "1").trim() === "1";
+const POST_META_TTL_MS = Number(process.env.POST_META_TTL_MS || 10 * 60 * 1000)
 
-// ВАЖНО: по умолчанию выключаем BAIT на первый коммент
-const BAIT_ON_FIRST_COMMENT = String(process.env.BAIT_ON_FIRST_COMMENT || "0").trim() === "1";
+const NEW_POST_ITEMS = new Set(["post", "video", "photo"])
 
-// Окно “свежего поста” для first_comment_fallback, в минутах
-const BAIT_FRESH_POST_WINDOW_MIN = Number(process.env.BAIT_FRESH_POST_WINDOW_MIN || 120);
-
-const BAIT_DELAY_MIN_MS = Number(process.env.BAIT_DELAY_MIN_MS || 1500);
-const BAIT_DELAY_MAX_MS = Number(process.env.BAIT_DELAY_MAX_MS || 4000);
-const BAIT_CACHE_TTL_MS = Number(process.env.BAIT_CACHE_TTL_MS || 7 * 24 * 60 * 60 * 1000);
-const BAIT_MAX_CHARS = Number(process.env.BAIT_MAX_CHARS || 220);
-
-const baitCache = new Map(); // postId -> { ts, commentId, text }
-const baitInflight = new Set(); // postId
-
-// кеш меты поста (created_time), чтобы не дергать Graph на каждый коммент
-const POST_META_TTL_MS = Number(process.env.POST_META_TTL_MS || 10 * 60 * 1000);
-const postMetaCache = new Map(); // postId -> { ts, createdMs, published }
-
-// BAIT на "новый пост" только для реальных публикаций
-const NEW_POST_ITEMS = new Set(["post", "video", "photo"]);
-
-const isBotEnabled = () => String(process.env.BOT_ENABLED || "").trim() === "1";
-// По умолчанию 1. Выключение: REPLY_TO_REPLIES=0
-const replyToRepliesEnabled = () => String(process.env.REPLY_TO_REPLIES || "1").trim() === "1";
-
-const nowMs = () => Date.now();
+const isBotEnabled = () => String(process.env.BOT_ENABLED || "").trim() === "1"
+const replyToRepliesEnabled = () => String(process.env.REPLY_TO_REPLIES || "1").trim() === "1"
 
 const safeSlice = (s, n) => {
-  const t = String(s || "");
-  if (!n || n <= 0) return "";
-  if (t.length <= n) return t;
-  return t.slice(0, n).replace(/\s+/g, " ").trim();
-};
-
-const logJson = (tag, obj) => {
-  try {
-    console.log(tag, JSON.stringify(obj));
-  } catch (e) {
-    console.log(tag, String(e));
-  }
-};
-
-const logWebhookEvent = (meta) => logJson("WEBHOOK_EVENT", meta || {});
-const logSkip = (reason, meta) => logJson("SKIP", { reason, ...(meta || {}) });
-
-const randInt = (min, max) => {
-  const a = Number(min);
-  const b = Number(max);
-  const lo = Math.min(a, b);
-  const hi = Math.max(a, b);
-  return Math.floor(lo + Math.random() * (hi - lo + 1));
-};
-
-const prune = (arr, windowMs) => {
-  const cutoff = nowMs() - windowMs;
-  while (arr.length && arr[0] < cutoff) arr.shift();
-};
-
-const allowReplyByRate = () => {
-  prune(replyHour, 60 * 60 * 1000);
-  prune(replyDay, 24 * 60 * 60 * 1000);
-  return replyHour.length < MAX_REPLIES_PER_HOUR && replyDay.length < MAX_REPLIES_PER_DAY;
-};
-
-const markReply = () => {
-  const t = nowMs();
-  replyHour.push(t);
-  replyDay.push(t);
-};
-
-const pruneThreadReplies = () => {
-  const cutoff = nowMs() - 48 * 60 * 60 * 1000;
-  for (const [k, v] of threadReplies.entries()) {
-    if (!v || v.ts < cutoff) threadReplies.delete(k);
-  }
-};
-
-const getThreadKey = (value, commentId) => {
-  const parentId = String(value?.parent_id || "");
-  const postId = String(value?.post_id || "");
-  if (parentId && postId && parentId !== postId) return parentId;
-  return commentId;
-};
-
-const allowReplyInThread = (threadKey) => {
-  pruneThreadReplies();
-  const cur = threadReplies.get(threadKey);
-  const count = Number(cur?.count || 0);
-  return count < MAX_BOT_REPLIES_PER_THREAD;
-};
-
-const markThreadReply = (threadKey) => {
-  const cur = threadReplies.get(threadKey);
-  const count = Number(cur?.count || 0) + 1;
-  threadReplies.set(threadKey, { count, ts: nowMs() });
-};
-
-const rememberComment = (id) => {
-  processedComments.set(id, Date.now());
-  if (processedComments.size <= MAX_PROCESSED) return;
-  const oldest = processedComments.keys().next().value;
-  if (oldest) processedComments.delete(oldest);
-};
-
-const wasProcessed = (id) => processedComments.has(id);
+  const t = String(s || "")
+  if (!n || n <= 0) return ""
+  if (t.length <= n) return t
+  return t.slice(0, n).replace(/\s+/g, " ").trim()
+}
 
 const normalize = (s) =>
   String(s || "")
     .replace(/\s+/g, " ")
-    .trim();
+    .trim()
+
+const logJson = (tag, obj) => {
+  try {
+    console.log(tag, JSON.stringify(obj))
+  } catch (e) {
+    console.log(tag, String(e))
+  }
+}
+
+const randInt = (min, max) => {
+  const a = Number(min)
+  const b = Number(max)
+  const lo = Math.min(a, b)
+  const hi = Math.max(a, b)
+  return Math.floor(lo + Math.random() * (hi - lo + 1))
+}
+
+const prune = (arr, windowMs) => {
+  const cutoff = nowMs() - windowMs
+  while (arr.length && arr[0] < cutoff) arr.shift()
+}
+
+const hasCyrillic = (s) => /[А-Яа-яЁё]/.test(String(s || ""))
+const hasLatin = (s) => /[A-Za-z]/.test(String(s || ""))
 
 const isNoiseOnly = (msg) => {
-  const m = normalize(msg);
-  if (!m) return true;
-  if (m.length < 2) return true;
+  const m = normalize(msg)
+  if (!m) return true
+  if (m.length < 2) return true
+  if (/^(?:[\p{P}\p{S}\p{Z}]+)$/u.test(m)) return true
+  if (/^(?:[\p{Z}\p{Emoji_Presentation}\p{Extended_Pictographic}]+)$/u.test(m)) return true
+  return false
+}
 
-  if (/^(?:[\p{P}\p{S}\p{Z}]+)$/u.test(m)) return true;
-  if (/^(?:[\p{Z}\p{Emoji_Presentation}\p{Extended_Pictographic}]+)$/u.test(m)) return true;
-
-  return false;
-};
+const stripHashtags = (text) => {
+  const s = String(text || "")
+  return normalize(s.replace(/#[\p{L}\p{N}_]+/gu, " "))
+}
 
 const getFirstName = (fullName) => {
-  const n = normalize(fullName).replace(/[^A-Za-zÀ-ÿ' -]/g, "").trim();
-  if (!n) return "";
-  const first = n.split(/\s+/)[0] || "";
-  return first.slice(0, 24);
-};
+  const n = normalize(fullName).replace(/[^A-Za-zÀ-ÿА-Яа-яЁё' -]/g, "").trim()
+  if (!n) return ""
+  const first = n.split(/\s+/)[0] || ""
+  return first.slice(0, 24)
+}
 
 const extractLocation = (text) => {
-  const s = normalize(text);
-  if (!s) return "";
+  const s = normalize(text)
+  if (!s) return ""
 
-  const m = s.match(/\b(?:from|in|here in|out in)\s+([A-Za-z][A-Za-z .'-]{2,40})(?:,\s*([A-Z]{2}))?\b/i);
-  if (!m) return "";
+  const mEn = s.match(/\b(?:from|in|here in|out in)\s+([A-Za-z][A-Za-z .'-]{2,40})(?:,\s*([A-Z]{2}))?\b/i)
+  if (mEn) {
+    const raw = normalize(mEn[1] || "")
+    const st = normalize(mEn[2] || "")
+    const bad = new Set(["this", "the", "a", "my", "your", "that", "it", "here", "there", "video", "post", "comments", "thread"])
+    const firstWord = raw.split(/\s+/)[0]?.toLowerCase() || ""
+    if (bad.has(firstWord)) return ""
+    const cleaned = raw.replace(/[^A-Za-z .'-]/g, "").trim()
+    if (!cleaned) return ""
+    if (st && /^[A-Z]{2}$/.test(st)) return `${cleaned}, ${st}`
+    return cleaned
+  }
 
-  const raw = normalize(m[1] || "");
-  const st = normalize(m[2] || "");
+  const mRu = s.match(/\b(?:из|в|во|тут в|здесь в)\s+([А-Яа-яЁё][А-Яа-яЁё .'-]{2,40})\b/i)
+  if (mRu) {
+    const raw = normalize(mRu[1] || "")
+    const cleaned = raw.replace(/[^A-Za-zÀ-ÿА-Яа-яЁё .'-]/g, "").trim()
+    if (!cleaned) return ""
+    return cleaned
+  }
 
-  const bad = new Set(["this", "the", "a", "my", "your", "that", "it", "here", "there", "video", "post", "comments", "thread"]);
-  const firstWord = raw.split(/\s+/)[0]?.toLowerCase() || "";
-  if (bad.has(firstWord)) return "";
+  return ""
+}
 
-  const cleaned = raw.replace(/[^A-Za-z .'-]/g, "").trim();
-  if (!cleaned) return "";
-
-  if (st && /^[A-Z]{2}$/.test(st)) return `${cleaned}, ${st}`;
-  return cleaned;
-};
-
-const analyzeSignals = (comment) => {
-  const msg = normalize(comment?.message);
-  const parent = normalize(comment?.parent?.message);
-  const joined = `${parent} ${msg}`.trim();
-
-  const sarcasmLikely =
-    /\/s\b|sarcasm|yeah right|sure buddy|what a discovery|captain obvious|thanks a lot/i.test(joined);
-
-  const jinxingLikely =
-    /\bjinx\b|don't jinx|dont jinx|knock on wood|appliance gods|curse|hex|now you're gonna have|now youre gonna have|you'll have problems|youll have problems/i.test(
-      joined
-    );
-
-  const bsLikely =
-    /\b(bullshit|bs|b\s*s|not true|fake|doesn'?t work|does not work|waste of time|scam)\b/i.test(joined);
-
-  const debateLikely =
-    /\bfake\b|\bcap\b|\bbs\b|doesn'?t work|works\b|i tried|tried it|tested|no it|nah it/i.test(joined);
-
-  const worryLikely =
-    /\bgonna break\b|\bgoing to break\b|break my|crack|damage|ruin|snap|strip the/i.test(joined);
-
-  const praiseLikely =
-    /\b(thanks|thank you|helped|works|worked|love this|awesome|great|genius|saved me|life saver)\b/i.test(joined);
-
-  const questionLikely = /\?/.test(msg);
-
-  const location = extractLocation(joined);
-
-  return { sarcasmLikely, jinxingLikely, bsLikely, debateLikely, worryLikely, praiseLikely, questionLikely, location };
-};
-
-// parent_id != post_id => это ответ в ветке
 const isReplyEvent = (value) => {
-  const postId = String(value?.post_id || "");
-  const parentId = String(value?.parent_id || "");
-  if (!postId || !parentId) return false;
-  return parentId !== postId;
-};
+  const postId = String(value?.post_id || "")
+  const parentId = String(value?.parent_id || "")
+  if (!postId || !parentId) return false
+  return parentId !== postId
+}
 
-const pruneCommentCache = () => {
-  const cutoff = nowMs() - COMMENT_CACHE_TTL_MS;
-  for (const [k, v] of commentCache.entries()) {
-    if (!v || v.ts < cutoff) commentCache.delete(k);
+const getThreadKey = (value, commentId) => {
+  const parentId = String(value?.parent_id || "")
+  const postId = String(value?.post_id || "")
+  if (parentId && postId && parentId !== postId) return parentId
+  return commentId
+}
+
+const pickId = (obj) => String(obj?.id || obj?.comment_id || obj?.commentId || "").trim()
+
+const parsePageTokenMap = () => {
+  const out = Object.create(null)
+
+  const rawJson = String(process.env.FB_PAGE_TOKENS_JSON || "").trim()
+  if (rawJson) {
+    try {
+      const parsed = JSON.parse(rawJson)
+      if (parsed && typeof parsed === "object") {
+        for (const [k, v] of Object.entries(parsed)) {
+          const pid = String(k || "").trim()
+          const tok = String(v || "").trim()
+          if (pid && tok) out[pid] = tok
+        }
+      }
+    } catch (_) {}
   }
-};
 
-const getCachedComment = (commentId) => {
-  pruneCommentCache();
-  const v = commentCache.get(commentId);
-  if (!v) return null;
+  const raw = String(process.env.FB_PAGE_TOKENS || "").trim()
+  if (raw) {
+    const parts = raw.split(",").map((x) => x.trim()).filter(Boolean)
+    for (const p of parts) {
+      const eq = p.indexOf("=")
+      if (eq <= 0) continue
+      const pid = p.slice(0, eq).trim()
+      const tok = p.slice(eq + 1).trim()
+      if (pid && tok) out[pid] = tok
+    }
+  }
+
+  return out
+}
+
+const PAGE_TOKENS = parsePageTokenMap()
+const SINGLE_PAGE_TOKEN = String(process.env.FB_PAGE_TOKEN || "").trim()
+
+const getPageToken = (pageId) => {
+  const pid = String(pageId || "").trim()
+  if (pid && PAGE_TOKENS[pid]) return PAGE_TOKENS[pid]
+  if (SINGLE_PAGE_TOKEN) return SINGLE_PAGE_TOKEN
+  return ""
+}
+
+const extractPageId = (entry, value) => {
+  const a = String(value?.page_id || "").trim()
+  const b = String(entry?.id || "").trim()
+  const c = String(entry?.page_id || "").trim()
+  return a || b || c
+}
+
+const pageStates = new Map()
+
+const createPageState = (pageId) => ({
+  pageIdHint: String(pageId || "").trim(),
+  pageIdResolved: String(pageId || "").trim(),
+  pageName: "",
+  forceRussian: false,
+
+  replyQueue: [],
+  processingQueue: false,
+  nextReplyAllowedAt: 0,
+  nextLikeAllowedAt: 0,
+
+  processedComments: new Map(),
+  inflight: new Set(),
+
+  replyHour: [],
+  replyDay: [],
+  threadReplies: new Map(),
+
+  postCache: new Map(),
+  commentCache: new Map(),
+  postMetaCache: new Map(),
+
+  baitCache: new Map(),
+  baitInflight: new Set()
+})
+
+const getPageState = (pageId) => {
+  const pid = String(pageId || "").trim() || "__unknown__"
+  const existing = pageStates.get(pid)
+  if (existing) return existing
+  const s = createPageState(pid)
+  pageStates.set(pid, s)
+  return s
+}
+
+const rememberComment = (state, id) => {
+  const key = String(id || "").trim()
+  if (!key) return
+  state.processedComments.set(key, nowMs())
+  if (state.processedComments.size <= 5000) return
+  const oldest = state.processedComments.keys().next().value
+  if (oldest) state.processedComments.delete(oldest)
+}
+
+const wasProcessed = (state, id) => {
+  const key = String(id || "").trim()
+  if (!key) return false
+  return state.processedComments.has(key)
+}
+
+const pruneThreadReplies = (state) => {
+  const cutoff = nowMs() - 48 * 60 * 60 * 1000
+  for (const [k, v] of state.threadReplies.entries()) {
+    if (!v || v.ts < cutoff) state.threadReplies.delete(k)
+  }
+}
+
+const allowReplyInThread = (state, threadKey) => {
+  pruneThreadReplies(state)
+  const cur = state.threadReplies.get(threadKey)
+  const count = Number(cur?.count || 0)
+  return count < MAX_BOT_REPLIES_PER_THREAD
+}
+
+const markThreadReply = (state, threadKey) => {
+  const cur = state.threadReplies.get(threadKey)
+  const count = Number(cur?.count || 0) + 1
+  state.threadReplies.set(threadKey, { count, ts: nowMs() })
+}
+
+const allowReplyByRate = (state) => {
+  prune(state.replyHour, 60 * 60 * 1000)
+  prune(state.replyDay, 24 * 60 * 60 * 1000)
+  return state.replyHour.length < MAX_REPLIES_PER_HOUR && state.replyDay.length < MAX_REPLIES_PER_DAY
+}
+
+const markReply = (state) => {
+  const t = nowMs()
+  state.replyHour.push(t)
+  state.replyDay.push(t)
+}
+
+const pruneCommentCache = (state) => {
+  const cutoff = nowMs() - COMMENT_CACHE_TTL_MS
+  for (const [k, v] of state.commentCache.entries()) {
+    if (!v || v.ts < cutoff) state.commentCache.delete(k)
+  }
+}
+
+const getCachedComment = (state, commentId) => {
+  pruneCommentCache(state)
+  const v = state.commentCache.get(commentId)
+  if (!v) return null
   if (nowMs() - v.ts > COMMENT_CACHE_TTL_MS) {
-    commentCache.delete(commentId);
-    return null;
+    state.commentCache.delete(commentId)
+    return null
   }
-  return v.comment || null;
-};
+  return v.comment || null
+}
 
-const setCachedComment = (commentId, comment) => {
-  pruneCommentCache();
-  commentCache.set(commentId, { ts: nowMs(), comment });
-};
-
-const fetchComment = async (commentId, pageToken) => {
-  const url = new URL(`${GRAPH_API_BASE}/${commentId}`);
-  url.searchParams.set(
-    "fields",
-    "message,from{id,name},permalink_url,created_time,parent{id,message,from{id,name}}"
-  );
-  url.searchParams.set("access_token", pageToken);
-
-  const r = await fetch(url.toString());
-  if (!r.ok) {
-    const t = await r.text();
-    throw new Error(`Fetch comment failed ${r.status}: ${t}`);
-  }
-  return r.json();
-};
+const setCachedComment = (state, commentId, comment) => {
+  pruneCommentCache(state)
+  state.commentCache.set(commentId, { ts: nowMs(), comment })
+}
 
 const readGraphResult = async (r) => {
-  const t = await r.text();
-  if (!t) return null;
+  const t = await r.text()
+  if (!t) return null
   try {
-    return JSON.parse(t);
+    return JSON.parse(t)
   } catch (_) {
-    return t;
+    return t
   }
-};
+}
+
+const fetchComment = async (commentId, pageToken) => {
+  const url = new URL(`${GRAPH_API_BASE}/${commentId}`)
+  url.searchParams.set("fields", "message,from{id,name},permalink_url,created_time,parent{id,message,from{id,name}}")
+  url.searchParams.set("access_token", pageToken)
+
+  const r = await fetch(url.toString())
+  if (!r.ok) {
+    const t = await r.text()
+    throw new Error(`Fetch comment failed ${r.status}: ${t}`)
+  }
+  return r.json()
+}
 
 const likeComment = async (commentId, pageToken) => {
   const r = await fetch(`${GRAPH_API_BASE}/${commentId}/likes`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ access_token: pageToken })
-  });
+  })
 
   if (!r.ok) {
-    const t = await r.text();
-    throw new Error(`Like failed ${r.status}: ${t}`);
+    const t = await r.text()
+    throw new Error(`Like failed ${r.status}: ${t}`)
   }
 
-  const data = await readGraphResult(r);
-  if (data === true) return true;
-  if (data === "true") return true;
-  if (data && typeof data === "object" && data.success === true) return true;
-
-  return true;
-};
+  const data = await readGraphResult(r)
+  if (data === true) return true
+  if (data === "true") return true
+  if (data && typeof data === "object" && data.success === true) return true
+  return true
+}
 
 const fetchPost = async (postId, pageToken) => {
-  if (!postId) return null;
+  if (!postId) return null
 
-  const url = new URL(`${GRAPH_API_BASE}/${postId}`);
+  const url = new URL(`${GRAPH_API_BASE}/${postId}`)
   url.searchParams.set(
     "fields",
-    [
-      "message",
-      "story",
-      "permalink_url",
-      "created_time",
-      "attachments{media_type,title,description,url}"
-    ].join(",")
-  );
-  url.searchParams.set("access_token", pageToken);
+    ["message", "story", "permalink_url", "created_time", "attachments{media_type,title,description,url}"].join(",")
+  )
+  url.searchParams.set("access_token", pageToken)
 
-  const r = await fetch(url.toString());
+  const r = await fetch(url.toString())
   if (!r.ok) {
-    const t = await r.text();
-    throw new Error(`Fetch post failed ${r.status}: ${t}`);
+    const t = await r.text()
+    throw new Error(`Fetch post failed ${r.status}: ${t}`)
   }
-  return r.json();
-};
+  return r.json()
+}
 
 const fetchPostMeta = async (postId, pageToken) => {
-  if (!postId) return null;
+  if (!postId) return null
 
-  const url = new URL(`${GRAPH_API_BASE}/${postId}`);
-  url.searchParams.set("fields", "created_time,published");
-  url.searchParams.set("access_token", pageToken);
+  const url = new URL(`${GRAPH_API_BASE}/${postId}`)
+  url.searchParams.set("fields", "created_time,published")
+  url.searchParams.set("access_token", pageToken)
 
-  const r = await fetch(url.toString());
-  if (!r.ok) return null;
-  return r.json();
-};
+  const r = await fetch(url.toString())
+  if (!r.ok) return null
+  return r.json()
+}
 
-const prunePostMetaCache = () => {
-  const cutoff = nowMs() - POST_META_TTL_MS;
-  for (const [k, v] of postMetaCache.entries()) {
-    if (!v || v.ts < cutoff) postMetaCache.delete(k);
+const prunePostMetaCache = (state) => {
+  const cutoff = nowMs() - POST_META_TTL_MS
+  for (const [k, v] of state.postMetaCache.entries()) {
+    if (!v || v.ts < cutoff) state.postMetaCache.delete(k)
   }
-};
+}
 
-const getPostMeta = async (postId, pageToken) => {
-  prunePostMetaCache();
-  const cached = postMetaCache.get(postId);
-  if (cached && nowMs() - cached.ts < POST_META_TTL_MS) return cached;
+const getPostMeta = async (state, postId, pageToken) => {
+  prunePostMetaCache(state)
+  const cached = state.postMetaCache.get(postId)
+  if (cached && nowMs() - cached.ts < POST_META_TTL_MS) return cached
 
   try {
-    const meta = await fetchPostMeta(postId, pageToken);
-    const createdMs = Date.parse(meta?.created_time || "") || 0;
-    const published = Number(meta?.published ?? 1);
-    const out = { ts: nowMs(), createdMs, published };
-    postMetaCache.set(postId, out);
-    return out;
+    const meta = await fetchPostMeta(postId, pageToken)
+    const createdMs = Date.parse(meta?.created_time || "") || 0
+    const published = Number(meta?.published ?? 1)
+    const out = { ts: nowMs(), createdMs, published }
+    state.postMetaCache.set(postId, out)
+    return out
   } catch (_) {
-    const out = { ts: nowMs(), createdMs: 0, published: 1 };
-    postMetaCache.set(postId, out);
-    return out;
+    const out = { ts: nowMs(), createdMs: 0, published: 1 }
+    state.postMetaCache.set(postId, out)
+    return out
   }
-};
+}
 
 const buildPostContext = (post) => {
-  if (!post) return "";
+  if (!post) return ""
 
-  const parts = [];
+  const parts = []
+  const msg = normalize(post?.message)
+  const story = normalize(post?.story)
 
-  const msg = normalize(post?.message);
-  const story = normalize(post?.story);
+  if (msg) parts.push(`Post caption: "${msg}"`)
+  else if (story) parts.push(`Post text: "${story}"`)
 
-  if (msg) parts.push(`Post caption: "${msg}"`);
-  else if (story) parts.push(`Post text: "${story}"`);
-
-  const att = post?.attachments?.data;
+  const att = post?.attachments?.data
   if (Array.isArray(att) && att.length) {
-    const a = att[0];
-    const t = normalize(a?.title);
-    const d = normalize(a?.description);
-    const mt = normalize(a?.media_type);
-
-    if (mt) parts.push(`Attachment type: ${mt}`);
-    if (t) parts.push(`Attachment title: "${t}"`);
-    if (d) parts.push(`Attachment description: "${d}"`);
+    const a = att[0]
+    const t = normalize(a?.title)
+    const d = normalize(a?.description)
+    const mt = normalize(a?.media_type)
+    if (mt) parts.push(`Attachment type: ${mt}`)
+    if (t) parts.push(`Attachment title: "${t}"`)
+    if (d) parts.push(`Attachment description: "${d}"`)
   }
 
-  const out = parts.join("\n");
-  return safeSlice(out, POST_CONTEXT_MAX_CHARS);
-};
+  const out = parts.join("\n")
+  return safeSlice(out, POST_CONTEXT_MAX_CHARS)
+}
 
-const getPostContext = async (postId, pageToken) => {
-  if (!postId) return "";
+const getPostContext = async (state, postId, pageToken) => {
+  if (!postId) return ""
 
-  const cached = postCache.get(postId);
-  const now = nowMs();
-
-  if (cached && now - cached.ts < POST_CACHE_TTL_MS) return cached.text || "";
+  const cached = state.postCache.get(postId)
+  const now = nowMs()
+  if (cached && now - cached.ts < POST_CACHE_TTL_MS) return cached.text || ""
 
   try {
-    const post = await fetchPost(postId, pageToken);
-    const text = buildPostContext(post);
-    postCache.set(postId, { ts: now, text });
-    return text;
+    const post = await fetchPost(postId, pageToken)
+    const text = buildPostContext(post)
+    state.postCache.set(postId, { ts: now, text })
+    return text
   } catch (e) {
-    postCache.set(postId, { ts: now, text: "" });
-    console.log("POST_CONTEXT_FETCH_FAILED", postId, String(e).slice(0, 300));
-    return "";
+    state.postCache.set(postId, { ts: now, text: "" })
+    if (LOG_WEBHOOK_EVENTS) logJson("POST_CONTEXT_FETCH_FAILED", { postId, err: String(e).slice(0, 240) })
+    return ""
   }
-};
+}
+
+const analyzeSignals = (comment) => {
+  const msg = normalize(comment?.message)
+  const parent = normalize(comment?.parent?.message)
+  const joined = `${parent} ${msg}`.trim()
+
+  const sarcasmLikely =
+    /\/s\b|sarcasm|yeah right|sure buddy|captain obvious|thanks a lot|nice one|sure thing|righttt|as if/i.test(joined) ||
+    /ага конечно|ну да|капитан очевидность|спасибо блин|смешно|ну-ну/i.test(joined)
+
+  const jinxingLikely =
+    /\bjinx\b|don't jinx|dont jinx|knock on wood|touch wood|appliance gods|curse|hex|now you're gonna have|now youre gonna have|you'll have problems|youll have problems/i.test(joined) ||
+    /сглаз|не сглазь|постучи по дереву|тьфу тьфу/i.test(joined) ||
+    /\b(never breaks|always works|works every time)\b/i.test(joined) ||
+    /никогда не ломалось|всегда работает|каждый раз работает/i.test(joined)
+
+  const bsLikely =
+    /\b(bullshit|bs|b\s*s|not true|fake|doesn'?t work|does not work|waste of time|scam)\b/i.test(joined) ||
+    /\b(cap|trash)\b/i.test(joined) ||
+    /бред|херня|фигня|не работает|развод|скам|пиздеж/i.test(joined)
+
+  const debateLikely =
+    /\bfake\b|\bcap\b|\bbs\b|doesn'?t work|works\b|i tried|tried it|tested|no it|nah it|prove it/i.test(joined) ||
+    /не работает|работает|проверил|пробовал|доказательства|пруф/i.test(joined)
+
+  const worryLikely =
+    /\bgonna break\b|\bgoing to break\b|break my|crack|damage|ruin|snap|strip the/i.test(joined) ||
+    /сломаю|не сломается|испортит|поцарапает|повредит/i.test(joined)
+
+  const praiseLikely =
+    /\b(thanks|thank you|helped|works|worked|love this|awesome|great|genius|saved me|life saver)\b/i.test(joined) ||
+    /спасибо|помогло|работает|сработало|круто|топ|огонь|гениально|спасло/i.test(joined)
+
+  const questionLikely = /\?/.test(msg)
+
+  const location = extractLocation(joined)
+
+  const britishLikely =
+    /\b(colour|favourite|centre|mum|mate|cheers|rubbish|bloody|queue|flat|loo|washing up)\b/i.test(joined) ||
+    /\b(uk|u\.k\.|england|scotland|wales|london|manchester|british)\b/i.test(joined) ||
+    /\bfrom\s+(?:the\s+)?uk\b/i.test(joined)
+
+  return { sarcasmLikely, jinxingLikely, bsLikely, debateLikely, worryLikely, praiseLikely, questionLikely, location, britishLikely }
+}
+
+const pickCuriosityTimestamp = (seed) => {
+  const s = String(seed || "")
+  let h = 0
+  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0
+  const times = ["0:12", "0:27", "0:45", "0:58"]
+  return times[h % times.length]
+}
+
+const detectReplyMode = (state, comment, postContext, signals) => {
+  const msg = normalize(comment?.message)
+  const parent = normalize(comment?.parent?.message)
+  const ctx = normalize(postContext)
+  const joined = `${parent} ${msg} ${ctx}`.trim()
+
+  if (state.forceRussian) return { lang: "ru" }
+  if (hasCyrillic(joined)) return { lang: "ru" }
+
+  const british = Boolean(signals?.britishLikely)
+  return { lang: british ? "en-uk" : "en-us" }
+}
 
 const buildPrompt = (comment, postContext, meta = {}) => {
-  const text = normalize(comment?.message);
-  const parentMsg = normalize(comment?.parent?.message);
-  const ctx = normalize(postContext);
+  const text = normalize(comment?.message)
+  const parentMsg = normalize(comment?.parent?.message)
+  const ctx = normalize(postContext)
 
-  const userName = normalize(meta?.userName);
-  const parentName = normalize(meta?.parentName);
+  const userName = normalize(meta?.userName)
+  const parentName = normalize(meta?.parentName)
 
-  const userFirst = getFirstName(userName);
-  const parentFirst = getFirstName(parentName);
+  const userFirst = getFirstName(userName)
+  const parentFirst = getFirstName(parentName)
 
-  const signals = meta?.signals || {};
-  const isReplyInThread = Boolean(meta?.isReply);
-  const location = normalize(meta?.location || signals.location || "");
+  const signals = meta?.signals || {}
+  const isReplyInThread = Boolean(meta?.isReply)
+  const location = normalize(meta?.location || signals.location || "")
+  const lang = String(meta?.lang || "en-us")
 
   const sigLine = [
     `jinxingLikely=${signals.jinxingLikely ? "true" : "false"}`,
@@ -467,151 +565,213 @@ const buildPrompt = (comment, postContext, meta = {}) => {
     `praiseLikely=${signals.praiseLikely ? "true" : "false"}`,
     `questionLikely=${signals.questionLikely ? "true" : "false"}`,
     `location=${location ? `"${location}"` : "none"}`,
-    `isReplyInThread=${isReplyInThread ? "true" : "false"}`
-  ].join(", ");
+    `isReplyInThread=${isReplyInThread ? "true" : "false"}`,
+    `lang=${lang}`
+  ].join(", ")
 
-  const lines = [
-    "Role: You manage the T.Lifehack USA Facebook/Reels channel. You are a savvy, friendly, witty American creator.",
-    "Goal: maximize engagement, push saves, grow community.",
-    "",
-    "Reply ONLY in English.",
-    "Sound human, friendly, witty, like you're in the comments with them.",
-    "Use contractions: don't, it's, you're, gonna, kinda, yep, nah.",
+  const curiosityTime = meta?.curiosityTime || "0:45"
+
+  const baseRules = [
     "Write 1 to 3 short sentences total.",
-    "Use 1 to 2 relevant emojis total. No hashtags.",
+    "Use 1 to 2 emojis total.",
+    "No hashtags.",
     "Do not mention AI, bots, automation, or policies.",
     "ALWAYS end with EXACTLY ONE question that invites a reply.",
     "The question must match the topic and the thread. No generic questions.",
-    "",
-    "Logic rules:",
-    "1) If bsLikely is true, use the BS strategy: empathize, say it worked for you, invite others to share real results.",
-    "2) If sarcasmLikely is true, answer with wit, then anchor it to a practical point.",
-    "3) If jinxingLikely is true, use: 'Knock on wood' culture.",
-    "4) If location is present, acknowledge it with weather vibe, like: 'Stay warm out there in [Location]'.",
-    "5) If praiseLikely is true, add a save trigger in the reply: 'Save this video'.",
-    "6) If questionLikely is true, add a curiosity gap cue tied to the video, like: 'rewatch around 0:45'.",
-    "7) If this is a reply thread and people are chatting, jump in briefly and keep it playful.",
-    "8) If nothing special triggers, be relatable: admit you were surprised too.",
-    "",
-    `Context signals: ${sigLine}`,
-    ""
-  ];
+    "If this is a reply thread, react to BOTH sides in a quick, playful way."
+  ]
+
+  const logicRulesEn = [
+    "If bsLikely is true: empathize, say it worked for you, invite others to share real results.",
+    "If sarcasmLikely is true: be witty first, then anchor it to a practical point.",
+    "If jinxingLikely is true: US uses 'Knock on wood'. UK uses 'Touch wood'. 'Appliance gods' fits both.",
+    "If location is present: acknowledge it with a weather vibe.",
+    "If praiseLikely is true: add 'Save this'.",
+    `If questionLikely is true: add a curiosity cue like 'rewatch around ${curiosityTime}'.`,
+    "If debateLikely is true: jump into the discussion briefly and keep it light.",
+    "If nothing special triggers: be relatable and a bit surprised."
+  ]
+
+  const logicRulesRu = [
+    "Если bsLikely true: спокойно. 'Жаль, что не сработало', 'у меня сработало', 'пусть другие подтвердят'.",
+    "Если sarcasmLikely true: коротко, остроумно, потом по делу.",
+    "Если jinxingLikely true: 'постучи по дереву', 'не сглазить', 'боги техники'.",
+    "Если location есть: отметь локацию и погоду одной фразой.",
+    "Если praiseLikely true: добавь 'Сохрани'.",
+    `Если questionLikely true: добавь таймкод, например 'пересмотри около ${curiosityTime}'.`,
+    "Если ветка спорная: вмешайся коротко и игриво.",
+    "Если ничего не триггерит: по-дружески, будто сам удивился."
+  ]
+
+  const header =
+    lang === "ru"
+      ? [
+          "Роль: Ты ведёшь страницу T.Lifehack. Ты живой, дружелюбный, чуть дерзкий автор в комментариях.",
+          "Цель: вовлечение, сохранения, дискуссии.",
+          "",
+          "Ответь ТОЛЬКО по-русски.",
+          ...baseRules,
+          ...logicRulesRu,
+          "",
+          `Сигналы: ${sigLine}`,
+          ""
+        ]
+      : lang === "en-uk"
+      ? [
+          "Role: You manage the T.Lifehack page. You are a savvy, friendly, witty creator in the comments.",
+          "Goal: maximize engagement, push saves, grow community.",
+          "",
+          "Reply ONLY in British English.",
+          "Use contractions: don't, it's, you're, gonna, kinda, yep, nah.",
+          "Use UK vibe when it fits: mate, cheers. Use British spelling: colour, favourite.",
+          ...baseRules,
+          ...logicRulesEn,
+          "",
+          `Context signals: ${sigLine}`,
+          ""
+        ]
+      : [
+          "Role: You manage the T.Lifehack USA Facebook/Reels page. You are a savvy, friendly, witty American creator.",
+          "Goal: maximize engagement, push saves, grow community.",
+          "",
+          "Reply ONLY in American English.",
+          "Use contractions: don't, it's, you're, gonna, kinda, yep, nah.",
+          ...baseRules,
+          ...logicRulesEn,
+          "",
+          `Context signals: ${sigLine}`,
+          ""
+        ]
+
+  const lines = [...header]
 
   if (ctx) {
-    lines.push("Post context:");
-    lines.push(ctx);
-    lines.push("");
+    lines.push("Post context:")
+    lines.push(ctx)
+    lines.push("")
   }
 
   if (parentMsg) {
-    lines.push(`Parent comment (${parentFirst || "viewer"}): "${parentMsg}"`);
-    lines.push("");
+    lines.push(`Parent comment (${parentFirst || "viewer"}): "${parentMsg}"`)
+    lines.push("")
   }
 
-  lines.push(`New comment (${userFirst || "viewer"}): "${text}"`);
-  lines.push("");
+  lines.push(`New comment (${userFirst || "viewer"}): "${text}"`)
+  lines.push("")
 
-  return lines.join("\n");
-};
+  if (isReplyInThread || signals.debateLikely) {
+    lines.push("End your final question addressing the new commenter by first name if available.")
+    lines.push("")
+  }
 
-const buildBaitPrompt = (postContext) => {
-  const ctx = normalize(postContext);
+  return lines.join("\n")
+}
 
-  const lines = [
+const buildBaitPrompt = (postContext, lang) => {
+  const ctx = normalize(postContext)
+
+  if (lang === "ru") {
+    return [
+      "Задача: Напиши ОДИН провокационный комментарий под новым видео T.Lifehack.",
+      "Цель: запустить спор, мнения, дискуссию.",
+      "Стратегия: полярный вопрос или вызов.",
+      "",
+      "Правила:",
+      "Пиши ТОЛЬКО по-русски.",
+      "1 или 2 коротких предложения.",
+      "1 или 2 эмодзи.",
+      "Без хештегов.",
+      "Не упоминай закреп, бота, AI, автоматизацию.",
+      "Максимально по теме контекста поста.",
+      "В конце ровно 1 вопрос.",
+      "",
+      "Контекст поста:",
+      ctx || "(нет контекста)",
+      ""
+    ].join("\n")
+  }
+
+  if (lang === "en-uk") {
+    return [
+      "Task: Write ONE engagement bait comment for a new T.Lifehack video.",
+      "Goal: spark debate and opinions.",
+      "Strategy: a polarising question or a challenge.",
+      "",
+      "Rules:",
+      "Reply ONLY in British English.",
+      "1 to 2 short sentences.",
+      "Use 1 to 2 emojis.",
+      "No hashtags.",
+      "Do not mention pinning, bots, AI, or automation.",
+      "Make it specific to the post context.",
+      "End with EXACTLY ONE question.",
+      "",
+      "Post context:",
+      ctx || "(no context)",
+      ""
+    ].join("\n")
+  }
+
+  return [
     "Task: Write ONE engagement bait comment for a new T.Lifehack USA video.",
     "Goal: spark debate, opinions, arguments, and 'I didn’t know' reactions.",
     "Strategy: use a polarizing question or a challenge.",
     "",
     "Rules:",
-    "Reply ONLY in English.",
-    "Write 1 to 2 short sentences.",
+    "Reply ONLY in American English.",
+    "1 to 2 short sentences.",
     "Use 1 to 2 emojis.",
     "No hashtags.",
     "Do not mention pinning, bots, AI, or automation.",
-    "Make it specific to the post context. Use the object from the hack if visible in context.",
+    "Make it specific to the post context.",
     "End with EXACTLY ONE question.",
-    "",
-    "Examples style (do not copy):",
-    "Team A vs Team B. Which side are you on?",
-    "Scale 1-10. How surprising was this?",
     "",
     "Post context:",
     ctx || "(no context)",
     ""
-  ];
+  ].join("\n")
+}
 
-  return lines.join("\n");
-};
+const ensureNameInQuestion = (text, name, enabled) => {
+  if (!enabled) return text
+  const n = String(name || "").trim()
+  if (!n) return text
 
-const extractOpenAiText = (data) => {
-  if (typeof data?.output_text === "string" && data.output_text.trim()) {
-    return data.output_text.trim();
-  }
+  const s = String(text || "").trim()
+  const qPos = s.lastIndexOf("?")
+  if (qPos < 0) return s
 
-  const outputs = Array.isArray(data?.output) ? data.output : [];
-  for (const o of outputs) {
-    const items = Array.isArray(o?.content) ? o.content : [];
-    for (const i of items) {
-      if (i?.type === "output_text" && typeof i?.text === "string") {
-        const t = i.text.trim();
-        if (t) return t;
-      }
-    }
-  }
-  return "";
-};
+  const body = s.slice(0, qPos + 1)
+  const lower = body.toLowerCase()
+  if (lower.includes(n.toLowerCase())) return s
 
-const trimReply = (text, maxChars = 240) => {
-  const t = String(text || "").trim();
-  if (t.length <= maxChars) return t;
+  const prefix = s.slice(0, qPos)
+  const suffix = s.slice(qPos)
 
-  const clipped = t.slice(0, maxChars);
-  const lastSentenceEnd = Math.max(
-    clipped.lastIndexOf("."),
-    clipped.lastIndexOf("!"),
-    clipped.lastIndexOf("?")
-  );
+  const lastSentenceStart = Math.max(prefix.lastIndexOf("."), prefix.lastIndexOf("!"))
+  const head = lastSentenceStart >= 0 ? prefix.slice(0, lastSentenceStart + 1).trim() : ""
+  const question = lastSentenceStart >= 0 ? prefix.slice(lastSentenceStart + 1).trim() : prefix.trim()
 
-  if (lastSentenceEnd > 0) return clipped.slice(0, lastSentenceEnd + 1).trim();
-  return clipped.trim();
-};
+  const questionTrim = question.replace(/^[\s"']+/, "")
+  if (questionTrim.toLowerCase().startsWith(n.toLowerCase())) return s
 
-const enforceOneQuestionAtEnd = (text) => {
-  let s = String(text || "").trim();
-  if (!s) return s;
+  const rebuiltQuestion = `${n}, ${questionTrim}`.replace(/\s+/g, " ").trim()
+  const out = `${head ? head + " " : ""}${rebuiltQuestion}${suffix}`.replace(/\s+/g, " ").trim()
+  return out
+}
 
-  const qCount = (s.match(/\?/g) || []).length;
-  if (qCount > 1) {
-    const lastQ = s.lastIndexOf("?");
-    let before = s.slice(0, lastQ);
-    let after = s.slice(lastQ + 1);
-
-    before = before.replace(/\?/g, ".").replace(/\s+\./g, ".").trim();
-
-    if (/[A-Za-z0-9]/.test(after)) after = "";
-    after = after.replace(/\?/g, "").trim();
-
-    s = `${before}?${after ? " " + after : ""}`.trim();
-  }
-
-  const lastQ = s.lastIndexOf("?");
-  if (lastQ >= 0) {
-    const after = s.slice(lastQ + 1);
-    if (/[A-Za-z0-9]/.test(after)) {
-      s = s.slice(0, lastQ + 1).trim();
-    }
-  }
-
-  return s;
-};
-
-const looksNotEnglish = (text) => /[А-Яа-яЁё]/.test(String(text || ""));
+const isWrongLanguage = (text, lang) => {
+  const s = String(text || "")
+  if (!s.trim()) return true
+  if (lang === "ru") return !hasCyrillic(s)
+  return hasCyrillic(s)
+}
 
 const callOpenAi = async (input, temperature = 0.7, maxTokens = 180) => {
-  const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) throw new Error("OPENAI_API_KEY missing");
+  const apiKey = process.env.OPENAI_API_KEY
+  if (!apiKey) throw new Error("OPENAI_API_KEY missing")
 
-  const model = process.env.OPENAI_MODEL || "gpt-4.1-mini";
+  const model = process.env.OPENAI_MODEL || "gpt-4.1-mini"
 
   const r = await fetch("https://api.openai.com/v1/responses", {
     method: "POST",
@@ -625,66 +785,102 @@ const callOpenAi = async (input, temperature = 0.7, maxTokens = 180) => {
       temperature,
       max_output_tokens: maxTokens
     })
-  });
+  })
 
   if (!r.ok) {
-    const t = await r.text();
-    throw new Error(`OpenAI error ${r.status}: ${t}`);
+    const t = await r.text()
+    throw new Error(`OpenAI error ${r.status}: ${t}`)
   }
 
-  const data = await r.json();
-  return extractOpenAiText(data);
-};
+  const data = await r.json()
+  return extractOpenAiText(data)
+}
 
 const generateReply = async (comment, postContext, meta = {}) => {
-  let first = trimReply(await callOpenAi(buildPrompt(comment, postContext, meta), 0.9, 180), 240);
-  first = enforceOneQuestionAtEnd(first);
+  const lang = String(meta?.lang || "en-us")
+  const userFirst = getFirstName(meta?.userName || "")
+  const nameQuestion = Boolean(meta?.nameQuestion)
 
-  if (!first) throw new Error("Empty OpenAI reply");
-  if (!looksNotEnglish(first)) return first;
+  let first = await callOpenAi(buildPrompt(comment, postContext, meta), 0.9, 180)
+  first = trimReply(stripHashtags(first), 240)
+  first = enforceOneQuestionAtEnd(first)
+  first = ensureNameInQuestion(first, userFirst, nameQuestion)
 
-  const retryPrompt = [
-    "Rewrite the reply strictly in English.",
-    "Keep the same witty, human tone and contractions.",
-    "Write 1 to 3 short sentences.",
-    "Use 1 to 2 emojis.",
-    "End with exactly one question.",
-    "",
-    `Reply to rewrite: "${first}"`
-  ].join("\n");
+  if (!first) throw new Error("Empty OpenAI reply")
 
-  let second = trimReply(await callOpenAi(retryPrompt, 0.4, 180), 240);
-  second = enforceOneQuestionAtEnd(second);
+  if (!isWrongLanguage(first, lang === "ru" ? "ru" : "en")) return first
 
-  if (second && !looksNotEnglish(second)) return second;
+  const retryPrompt =
+    lang === "ru"
+      ? [
+          "Перепиши ответ строго по-русски.",
+          "Сохрани живой тон.",
+          "1–3 коротких предложения.",
+          "1–2 эмодзи.",
+          "В конце ровно 1 вопрос.",
+          "Без хештегов.",
+          "",
+          `Текст: "${first}"`
+        ].join("\n")
+      : [
+          "Rewrite the reply strictly in English.",
+          "Keep the same witty, human tone and contractions.",
+          "Write 1 to 3 short sentences.",
+          "Use 1 to 2 emojis.",
+          "End with exactly one question.",
+          "No hashtags.",
+          "",
+          `Reply to rewrite: "${first}"`
+        ].join("\n")
 
-  return first;
-};
+  let second = await callOpenAi(retryPrompt, 0.4, 180)
+  second = trimReply(stripHashtags(second), 240)
+  second = enforceOneQuestionAtEnd(second)
+  second = ensureNameInQuestion(second, userFirst, nameQuestion)
 
-const generateBaitComment = async (postContext) => {
-  let first = trimReply(await callOpenAi(buildBaitPrompt(postContext), 0.95, 140), BAIT_MAX_CHARS);
-  first = enforceOneQuestionAtEnd(first);
+  if (second && !isWrongLanguage(second, lang === "ru" ? "ru" : "en")) return second
 
-  if (!first) throw new Error("Empty OpenAI bait");
-  if (!looksNotEnglish(first)) return first;
+  return first
+}
 
-  const retryPrompt = [
-    "Rewrite strictly in English.",
-    "Write 1 to 2 short sentences.",
-    "Use 1 to 2 emojis.",
-    "End with exactly one question.",
-    "No hashtags.",
-    "",
-    `Text: "${first}"`
-  ].join("\n");
+const generateBaitComment = async (postContext, lang) => {
+  let first = await callOpenAi(buildBaitPrompt(postContext, lang), 0.95, 140)
+  first = trimReply(stripHashtags(first), BAIT_MAX_CHARS)
+  first = enforceOneQuestionAtEnd(first)
 
-  let second = trimReply(await callOpenAi(retryPrompt, 0.35, 140), BAIT_MAX_CHARS);
-  second = enforceOneQuestionAtEnd(second);
+  if (!first) throw new Error("Empty OpenAI bait")
 
-  if (second && !looksNotEnglish(second)) return second;
+  if (!isWrongLanguage(first, lang === "ru" ? "ru" : "en")) return first
 
-  return first;
-};
+  const retryPrompt =
+    lang === "ru"
+      ? [
+          "Перепиши строго по-русски.",
+          "1 или 2 коротких предложения.",
+          "1 или 2 эмодзи.",
+          "В конце ровно 1 вопрос.",
+          "Без хештегов.",
+          "",
+          `Текст: "${first}"`
+        ].join("\n")
+      : [
+          "Rewrite strictly in English.",
+          "1 to 2 short sentences.",
+          "Use 1 to 2 emojis.",
+          "End with exactly one question.",
+          "No hashtags.",
+          "",
+          `Text: "${first}"`
+        ].join("\n")
+
+  let second = await callOpenAi(retryPrompt, 0.35, 140)
+  second = trimReply(stripHashtags(second), BAIT_MAX_CHARS)
+  second = enforceOneQuestionAtEnd(second)
+
+  if (second && !isWrongLanguage(second, lang === "ru" ? "ru" : "en")) return second
+
+  return first
+}
 
 const postReply = async (commentId, text, pageToken) => {
   const r = await fetch(`${GRAPH_API_BASE}/${commentId}/comments`, {
@@ -694,14 +890,14 @@ const postReply = async (commentId, text, pageToken) => {
       message: text,
       access_token: pageToken
     })
-  });
+  })
 
   if (!r.ok) {
-    const t = await r.text();
-    throw new Error(`Post reply failed ${r.status}: ${t}`);
+    const t = await r.text()
+    throw new Error(`Post reply failed ${r.status}: ${t}`)
   }
-  return r.json();
-};
+  return r.json()
+}
 
 const postCommentOnPost = async (postId, text, pageToken) => {
   const r = await fetch(`${GRAPH_API_BASE}/${postId}/comments`, {
@@ -711,288 +907,242 @@ const postCommentOnPost = async (postId, text, pageToken) => {
       message: text,
       access_token: pageToken
     })
-  });
+  })
 
   if (!r.ok) {
-    const t = await r.text();
-    throw new Error(`Post comment failed ${r.status}: ${t}`);
+    const t = await r.text()
+    throw new Error(`Post comment failed ${r.status}: ${t}`)
   }
-  return r.json();
-};
+  return r.json()
+}
 
-const pickId = (obj) => String(obj?.id || obj?.comment_id || obj?.commentId || "").trim();
-
-let runtimePageId = String(process.env.PAGE_ID || "").trim();
-let pageIdResolveAttempted = false;
-
-const resolvePageIdOnce = async (pageToken) => {
-  if (runtimePageId) return;
-  if (pageIdResolveAttempted) return;
-  pageIdResolveAttempted = true;
-
-  try {
-    const url = new URL(`${GRAPH_API_BASE}/me`);
-    url.searchParams.set("fields", "id,name");
-    url.searchParams.set("access_token", pageToken);
-
-    const r = await fetch(url.toString());
-    if (!r.ok) {
-      const t = await r.text();
-      console.log("PAGE_ID_AUTO_RESOLVE_FAILED", r.status, t.slice(0, 500));
-      return;
-    }
-
-    const data = await r.json();
-    if (data?.id) {
-      runtimePageId = String(data.id).trim();
-      console.log("PAGE_ID_AUTO_RESOLVED", runtimePageId, data?.name || "");
-    }
-  } catch (e) {
-    console.log("PAGE_ID_AUTO_RESOLVE_ERROR", String(e));
+const pruneBaitCache = (state) => {
+  const cutoff = nowMs() - BAIT_CACHE_TTL_MS
+  for (const [k, v] of state.baitCache.entries()) {
+    if (!v || v.ts < cutoff) state.baitCache.delete(k)
   }
-};
+}
 
-const gateAtForType = (type) => {
-  if (type === "like") return nextLikeAllowedAt;
-  return nextReplyAllowedAt;
-};
+const wasBaitPosted = (state, postId) => {
+  pruneBaitCache(state)
+  const v = state.baitCache.get(postId)
+  if (!v) return false
+  if (nowMs() - v.ts > BAIT_CACHE_TTL_MS) {
+    state.baitCache.delete(postId)
+    return false
+  }
+  return true
+}
 
-// берём задачу с самым ранним readyAt = max(dueAt, gateAt)
-const getNextTaskIndex = () => {
-  let bestIdx = -1;
-  let bestReady = Infinity;
+const markBaitPosted = (state, postId, commentId, text) => {
+  pruneBaitCache(state)
+  state.baitCache.set(postId, { ts: nowMs(), commentId: String(commentId || ""), text: String(text || "") })
+}
 
-  const now = nowMs();
-  for (let i = 0; i < replyQueue.length; i++) {
-    const dueAt = Number(replyQueue[i]?.dueAt || 0);
-    const type = String(replyQueue[i]?.type || "reply");
-    const gateAt = gateAtForType(type);
-    const readyAt = Math.max(dueAt, gateAt, now);
+const gateAtForType = (state, type) => {
+  if (type === "like") return state.nextLikeAllowedAt
+  return state.nextReplyAllowedAt
+}
+
+const getNextTaskIndex = (state) => {
+  let bestIdx = -1
+  let bestReady = Infinity
+
+  const now = nowMs()
+  for (let i = 0; i < state.replyQueue.length; i++) {
+    const dueAt = Number(state.replyQueue[i]?.dueAt || 0)
+    const type = String(state.replyQueue[i]?.type || "reply")
+    const gateAt = gateAtForType(state, type)
+    const readyAt = Math.max(dueAt, gateAt, now)
 
     if (readyAt < bestReady) {
-      bestReady = readyAt;
-      bestIdx = i;
+      bestReady = readyAt
+      bestIdx = i
     }
   }
-  return bestIdx;
-};
+  return bestIdx
+}
 
-const scheduleQueueProcessing = () => {
-  if (processingQueue) return;
-  processingQueue = true;
+const scheduleQueueProcessing = (state, pageId) => {
+  if (state.processingQueue) return
+  state.processingQueue = true
 
   const runNext = async () => {
     if (!isBotEnabled()) {
-      replyQueue.length = 0;
-      processingQueue = false;
-      console.log("BOT_DISABLED_CLEAR_QUEUE");
-      return;
+      state.replyQueue.length = 0
+      state.processingQueue = false
+      return
     }
 
-    if (!replyQueue.length) {
-      processingQueue = false;
-      return;
+    if (!state.replyQueue.length) {
+      state.processingQueue = false
+      return
     }
 
-    const idx = getNextTaskIndex();
+    const idx = getNextTaskIndex(state)
     if (idx < 0) {
-      processingQueue = false;
-      return;
+      state.processingQueue = false
+      return
     }
 
-    const taskObj = replyQueue[idx];
-    const now = Date.now();
+    const taskObj = state.replyQueue[idx]
+    const now = nowMs()
 
-    const dueAt = Number(taskObj.dueAt || 0);
-    const type = String(taskObj.type || "reply");
-    const gateAt = gateAtForType(type);
-    const readyAt = Math.max(dueAt, gateAt);
+    const dueAt = Number(taskObj.dueAt || 0)
+    const type = String(taskObj.type || "reply")
+    const gateAt = gateAtForType(state, type)
+    const readyAt = Math.max(dueAt, gateAt)
 
-    const waitMs = Math.max(0, readyAt - now);
+    const waitMs = Math.max(0, readyAt - now)
     if (waitMs > 0) {
-      setTimeout(runNext, waitMs);
-      return;
+      setTimeout(runNext, waitMs)
+      return
     }
 
-    replyQueue.splice(idx, 1);
+    state.replyQueue.splice(idx, 1)
 
     try {
-      const did = await taskObj.run();
+      const did = await taskObj.run()
       if (did) {
         if (type === "like") {
-          const gap = randInt(BETWEEN_LIKE_MIN_MS, BETWEEN_LIKE_MAX_MS);
-          nextLikeAllowedAt = Date.now() + gap;
+          const gap = randInt(BETWEEN_LIKE_MIN_MS, BETWEEN_LIKE_MAX_MS)
+          state.nextLikeAllowedAt = nowMs() + gap
         } else {
-          const gap = randInt(BETWEEN_REPLY_MIN_MS, BETWEEN_REPLY_MAX_MS);
-          nextReplyAllowedAt = Date.now() + gap;
+          const gap = randInt(BETWEEN_REPLY_MIN_MS, BETWEEN_REPLY_MAX_MS)
+          state.nextReplyAllowedAt = nowMs() + gap
         }
       }
     } catch (err) {
-      console.error("QUEUE_TASK_ERROR", err);
+      logJson("WEBHOOK ERROR", { pageId, err: String(err).slice(0, 400) })
       if (type === "like") {
-        const gap = randInt(BETWEEN_LIKE_MIN_MS, BETWEEN_LIKE_MAX_MS);
-        nextLikeAllowedAt = Date.now() + gap;
+        const gap = randInt(BETWEEN_LIKE_MIN_MS, BETWEEN_LIKE_MAX_MS)
+        state.nextLikeAllowedAt = nowMs() + gap
       } else {
-        const gap = randInt(BETWEEN_REPLY_MIN_MS, BETWEEN_REPLY_MAX_MS);
-        nextReplyAllowedAt = Date.now() + gap;
+        const gap = randInt(BETWEEN_REPLY_MIN_MS, BETWEEN_REPLY_MAX_MS)
+        state.nextReplyAllowedAt = nowMs() + gap
       }
     } finally {
-      setImmediate(runNext);
+      setImmediate(runNext)
     }
-  };
-
-  setImmediate(runNext);
-};
-
-const pruneBaitCache = () => {
-  const cutoff = nowMs() - BAIT_CACHE_TTL_MS;
-  for (const [k, v] of baitCache.entries()) {
-    if (!v || v.ts < cutoff) baitCache.delete(k);
   }
-};
 
-const wasBaitPosted = (postId) => {
-  pruneBaitCache();
-  const v = baitCache.get(postId);
-  if (!v) return false;
-  if (nowMs() - v.ts > BAIT_CACHE_TTL_MS) {
-    baitCache.delete(postId);
-    return false;
-  }
-  return true;
-};
+  setImmediate(runNext)
+}
 
-const markBaitPosted = (postId, commentId, text) => {
-  pruneBaitCache();
-  baitCache.set(postId, { ts: nowMs(), commentId: String(commentId || ""), text: String(text || "") });
-};
-
-const ensureBaitForPost = async (postId, pageToken, ts, reason) => {
-  if (!BAIT_ENABLED) return;
-  const pid = String(postId || "").trim();
-  if (!pid) return;
+const ensureBaitForPost = async (state, postId, pageToken, ts, reason, pageId) => {
+  if (!BAIT_ENABLED) return
+  const pid = String(postId || "").trim()
+  if (!pid) return
 
   if (!pid.includes("_")) {
-    logSkip("BAIT_BAD_POST_ID", { postId: pid, reason });
-    return;
+    if (LOG_SKIPS) logJson("SKIP", { reason: "BAIT_BAD_POST_ID", pageId, postId: pid, why: reason })
+    return
   }
 
-  if (wasBaitPosted(pid)) return;
-  if (baitInflight.has(pid)) return;
+  if (wasBaitPosted(state, pid)) return
+  if (state.baitInflight.has(pid)) return
 
-  // очередь ограничена
-  if (replyQueue.length + 1 > MAX_QUEUE_LENGTH) {
-    logSkip("BAIT_QUEUE_FULL", { postId: pid, queueLen: replyQueue.length, reason });
-    return;
+  if (state.replyQueue.length + 1 > MAX_QUEUE_LENGTH) {
+    if (LOG_SKIPS) logJson("SKIP", { reason: "BAIT_QUEUE_FULL", pageId, postId: pid, queueLen: state.replyQueue.length, why: reason })
+    return
   }
 
-  baitInflight.add(pid);
+  state.baitInflight.add(pid)
 
-  const dueAt = Date.now() + randInt(BAIT_DELAY_MIN_MS, BAIT_DELAY_MAX_MS);
+  const dueAt = nowMs() + randInt(BAIT_DELAY_MIN_MS, BAIT_DELAY_MAX_MS)
 
-  replyQueue.push({
+  state.replyQueue.push({
     type: "bait",
     postId: pid,
     dueAt,
     run: async () => {
       try {
-        if (!isBotEnabled()) return false;
-        if (wasBaitPosted(pid)) return false;
+        if (!isBotEnabled()) return false
+        if (wasBaitPosted(state, pid)) return false
 
-        const postContext = await getPostContext(pid, pageToken);
-        const bait = await generateBaitComment(postContext);
+        const postContext = await getPostContext(state, pid, pageToken)
+        if (hasCyrillic(postContext)) state.forceRussian = true
 
-        const posted = await postCommentOnPost(pid, bait, pageToken);
-        const postedId = pickId(posted);
+        const lang = state.forceRussian ? "ru" : "en-us"
+        const bait = await generateBaitComment(postContext, lang)
 
-        markBaitPosted(pid, postedId, bait);
+        const posted = await postCommentOnPost(pid, bait, pageToken)
+        const postedId = pickId(posted)
 
-        if (postedId) rememberComment(postedId);
+        markBaitPosted(state, pid, postedId, bait)
+        if (postedId) rememberComment(state, postedId)
 
-        logJson("BAIT_POSTED", {
-          at: ts,
-          postId: pid,
-          postedId,
-          bait,
-          reason
-        });
-
-        return true;
+        logJson("BAIT_POSTED", { at: ts, pageId, postId: pid, postedId, bait, reason })
+        return true
       } catch (e) {
-        logJson("BAIT_FAILED", {
-          at: ts,
-          postId: pid,
-          reason,
-          err: String(e).slice(0, 300)
-        });
-        return false;
+        logJson("BAIT_FAILED", { at: ts, pageId, postId: pid, reason, err: String(e).slice(0, 300) })
+        return false
       } finally {
-        baitInflight.delete(pid);
+        state.baitInflight.delete(pid)
       }
     }
-  });
+  })
 
-  scheduleQueueProcessing();
-};
-
-app.get("/webhook", (req, res) => {
-  const mode = req.query["hub.mode"];
-  const token = req.query["hub.verify_token"];
-  const challenge = req.query["hub.challenge"];
-
-  if (mode === "subscribe" && token === process.env.FB_VERIFY_TOKEN) {
-    return res.status(200).send(challenge);
-  }
-  return res.sendStatus(403);
-});
+  scheduleQueueProcessing(state, pageId)
+}
 
 const extractCommentId = (v) => {
-  if (!v) return "";
-  if (typeof v.comment_id === "string") return v.comment_id;
-  if (v.comment?.id) return v.comment.id;
-  if (v.commentId) return v.commentId;
-  return "";
-};
+  if (!v) return ""
+  if (typeof v.comment_id === "string") return v.comment_id
+  if (v.comment?.id) return v.comment.id
+  if (v.commentId) return v.commentId
+  return ""
+}
 
 const extractPostId = (v) => {
-  if (!v) return "";
-  if (typeof v.post_id === "string") return v.post_id;
-  if (typeof v.postId === "string") return v.postId;
-  return "";
-};
+  if (!v) return ""
+  if (typeof v.post_id === "string") return v.post_id
+  if (typeof v.postId === "string") return v.postId
+  return ""
+}
 
 app.post("/webhook", (req, res) => {
-  const ts = new Date().toISOString();
-  console.log("WEBHOOK IN", ts);
-  res.sendStatus(200);
+  const ts = new Date().toISOString()
+  res.sendStatus(200)
 
   setImmediate(async () => {
     try {
-      if (!isBotEnabled()) {
-        console.log("BOT_DISABLED");
-        return;
+      if (!isBotEnabled()) return
+
+      const entries = Array.isArray(req.body?.entry) ? req.body.entry : []
+      if (!entries.length) return
+
+      let webhookInLogged = false
+      const logWebhookInOnce = (meta) => {
+        if (!LOG_WEBHOOK_IN) return
+        if (webhookInLogged) return
+        if (LOG_ONLY_MESSAGE_EVENTS && !meta?.hasRealMessage) return
+        webhookInLogged = true
+        logJson("WEBHOOK IN", meta || {})
       }
 
-      const entries = Array.isArray(req.body?.entry) ? req.body.entry : [];
-      if (!entries.length) return;
-
-      const pageToken = process.env.FB_PAGE_TOKEN;
-      if (!pageToken) throw new Error("FB_PAGE_TOKEN missing");
-
-      await resolvePageIdOnce(pageToken);
-      const pageId = String(runtimePageId || "").trim();
-
       for (const e of entries) {
-        const changes = Array.isArray(e?.changes) ? e.changes : [];
+        const changes = Array.isArray(e?.changes) ? e.changes : []
+        if (!changes.length) continue
+
         for (const c of changes) {
-          if (c?.field !== "feed") continue;
+          if (c?.field !== "feed") continue
+          const value = c?.value || {}
 
-          const value = c?.value || {};
-          const item = String(value?.item || "").trim(); // comment, post, video, photo, reaction, etc
-          const verb = String(value?.verb || "").trim(); // add, edited, remove
-          const postId = String(extractPostId(value) || "").trim();
+          const pageId = extractPageId(e, value)
+          const pageToken = getPageToken(pageId)
+          if (!pageToken) {
+            logJson("WEBHOOK ERROR", { at: ts, pageId: pageId || "unknown", err: "FB_PAGE_TOKEN missing for pageId" })
+            continue
+          }
 
-          // NEW POST => BAIT COMMENT (только реальные публикации)
+          const state = getPageState(pageId)
+          if (!state.pageIdResolved && pageId) state.pageIdResolved = String(pageId)
+
+          const item = String(value?.item || "").trim()
+          const verb = String(value?.verb || "").trim()
+          const postId = String(extractPostId(value) || "").trim()
+
           if (
             BAIT_ENABLED &&
             BAIT_ON_NEW_POST &&
@@ -1001,204 +1151,173 @@ app.post("/webhook", (req, res) => {
             NEW_POST_ITEMS.has(item) &&
             Number(value?.published ?? 1) === 1
           ) {
-            await ensureBaitForPost(postId, pageToken, ts, `new_post_item=${item}`);
+            await ensureBaitForPost(state, postId, pageToken, ts, `new_post_item=${item}`, pageId)
           }
 
-          // COMMENTS
-          if (item !== "comment" || verb !== "add") continue;
+          if (item !== "comment" || verb !== "add") continue
 
-          const commentId = extractCommentId(value);
-          if (!commentId) continue;
+          const commentId = extractCommentId(value)
+          if (!commentId) continue
 
-          const parentId = String(value?.parent_id || "").trim();
-          const isReply = isReplyEvent(value);
-          const threadKey = getThreadKey(value, commentId);
+          const parentId = String(value?.parent_id || "").trim()
+          const isReply = isReplyEvent(value)
+          const threadKey = getThreadKey(value, commentId)
 
-          logWebhookEvent({
-            at: ts,
-            commentId,
-            postId,
-            parentId,
-            isReply,
-            item,
-            verb,
-            created_time: value?.created_time || null,
-            queueLen: replyQueue.length
-          });
-
-          if (wasProcessed(commentId)) {
-            logSkip("DUPLICATE", { commentId, postId, threadKey });
-            continue;
-          }
-
-          if (inflight.has(commentId)) {
-            logSkip("INFLIGHT", { commentId, postId, threadKey });
-            continue;
-          }
+          if (wasProcessed(state, commentId)) continue
+          if (state.inflight.has(commentId)) continue
 
           if (!replyToRepliesEnabled() && isReply) {
-            rememberComment(commentId);
-            logSkip("REPLY_THREAD_DISABLED", { commentId, postId, threadKey });
-            continue;
+            rememberComment(state, commentId)
+            continue
           }
 
-          // игнор старых
-          const createdSec = Number(value?.created_time || 0);
+          const createdSec = Number(value?.created_time || 0)
           if (createdSec) {
-            const createdMs = createdSec * 1000;
-            const ageSec = Math.floor((nowMs() - createdMs) / 1000);
+            const createdMs = createdSec * 1000
             if (nowMs() - createdMs > IGNORE_OLD_COMMENTS_MIN * 60 * 1000) {
-              rememberComment(commentId);
-              logSkip("OLD_COMMENT", { commentId, postId, threadKey, created_time: createdSec, ageSec });
-              continue;
+              rememberComment(state, commentId)
+              continue
             }
           }
 
-          // вероятность ответа
-          const prob = isReply ? REPLY_PROB_REPLY : REPLY_PROB_TOP;
-          const rnd = Math.random();
+          const prob = isReply ? REPLY_PROB_REPLY : REPLY_PROB_TOP
+          const rnd = Math.random()
           if (rnd > prob) {
-            rememberComment(commentId);
-            logSkip("PROBABILITY", { commentId, postId, threadKey, isReply, prob, rnd });
-            continue;
+            rememberComment(state, commentId)
+            continue
           }
 
-          // лимит по времени
-          if (!allowReplyByRate()) {
-            rememberComment(commentId);
-            prune(replyHour, 60 * 60 * 1000);
-            prune(replyDay, 24 * 60 * 60 * 1000);
-            logSkip("RATE_LIMIT", {
-              commentId,
-              postId,
-              threadKey,
-              hourCount: replyHour.length,
-              dayCount: replyDay.length
-            });
-            continue;
+          if (!allowReplyByRate(state)) {
+            rememberComment(state, commentId)
+            continue
           }
 
-          // лимит на ветку
-          if (!allowReplyInThread(threadKey)) {
-            rememberComment(commentId);
-            pruneThreadReplies();
-            const cur = threadReplies.get(threadKey);
-            const threadCount = Number(cur?.count || 0);
-            logSkip("THREAD_LIMIT", { commentId, postId, threadKey, threadCount });
-            continue;
+          if (!allowReplyInThread(state, threadKey)) {
+            rememberComment(state, commentId)
+            continue
           }
 
-          const tasksToAdd = LIKE_ENABLED ? 2 : 1;
-          if (replyQueue.length + tasksToAdd > MAX_QUEUE_LENGTH) {
-            rememberComment(commentId);
-            logSkip("QUEUE_FULL", { commentId, postId, threadKey, queueLen: replyQueue.length });
-            continue;
+          const tasksToAdd = LIKE_ENABLED ? 2 : 1
+          if (state.replyQueue.length + tasksToAdd > MAX_QUEUE_LENGTH) {
+            rememberComment(state, commentId)
+            continue
           }
 
-          // подтягиваем комментарий один раз, кладем в кеш, валидируем, и для логов тоже
-          let comment = getCachedComment(commentId);
+          let comment = getCachedComment(state, commentId)
           if (!comment) {
             try {
-              comment = await fetchComment(commentId, pageToken);
-              setCachedComment(commentId, comment);
+              comment = await fetchComment(commentId, pageToken)
+              setCachedComment(state, commentId, comment)
             } catch (err) {
-              rememberComment(commentId);
-              logSkip("COMMENT_FETCH_FAILED", { commentId, postId, threadKey, err: String(err).slice(0, 220) });
-              continue;
+              rememberComment(state, commentId)
+              if (LOG_SKIPS) logJson("SKIP", { reason: "COMMENT_FETCH_FAILED", pageId, commentId, postId, threadKey, err: String(err).slice(0, 220) })
+              continue
             }
           }
 
-          const msgForLog = safeSlice(comment?.message, WEBHOOK_MESSAGE_MAX_CHARS);
-          const fromForLog = String(comment?.from?.name || "");
-          const parentFromForLog = String(comment?.parent?.from?.name || "");
+          const msgForLog = safeSlice(comment?.message, WEBHOOK_MESSAGE_MAX_CHARS)
+          const msgIsReal = !isNoiseOnly(comment?.message)
 
-          if (LOG_WEBHOOK_MESSAGE) {
-            logJson("WEBHOOK_MESSAGE", {
+          if (LOG_ONLY_MESSAGE_EVENTS && !msgIsReal) {
+            rememberComment(state, commentId)
+            continue
+          }
+
+          logWebhookInOnce({ at: ts, pageId, hasRealMessage: msgIsReal })
+
+          if (LOG_WEBHOOK_EVENTS && (!LOG_ONLY_MESSAGE_EVENTS || msgIsReal)) {
+            logJson("WEBHOOK_EVENT", {
+              at: ts,
+              pageId,
               commentId,
               postId,
-              from: fromForLog,
+              parentId,
+              isReply,
+              item,
+              verb,
+              created_time: value?.created_time || null,
+              queueLen: state.replyQueue.length
+            })
+          }
+
+          if (LOG_WEBHOOK_MESSAGE && (!LOG_ONLY_MESSAGE_EVENTS || msgIsReal)) {
+            logJson("WEBHOOK_MESSAGE", {
+              pageId,
+              commentId,
+              postId,
+              from: String(comment?.from?.name || ""),
               msg: msgForLog,
-              parentFrom: parentFromForLog,
+              parentFrom: String(comment?.parent?.from?.name || ""),
               parentMsg: safeSlice(comment?.parent?.message, WEBHOOK_MESSAGE_MAX_CHARS)
-            });
+            })
           }
 
-          if (pageId && String(comment?.from?.id || "") === pageId) {
-            rememberComment(commentId);
-            logSkip("SELF", { commentId, postId, threadKey, msg: safeSlice(msgForLog, SKIP_MESSAGE_MAX_CHARS) });
-            continue;
+          const selfId = String(state.pageIdResolved || pageId || "").trim()
+          if (selfId && String(comment?.from?.id || "") === selfId) {
+            rememberComment(state, commentId)
+            if (LOG_SKIPS && (!LOG_ONLY_MESSAGE_EVENTS || msgIsReal)) {
+              logJson("SKIP", { reason: "SELF", pageId, commentId, postId, threadKey, msg: safeSlice(msgForLog, SKIP_MESSAGE_MAX_CHARS) })
+            }
+            continue
           }
 
-          if (isNoiseOnly(comment?.message)) {
-            rememberComment(commentId);
-            logSkip("NOISE", { commentId, postId, threadKey, msg: safeSlice(msgForLog, SKIP_MESSAGE_MAX_CHARS) });
-            continue;
+          if (!msgIsReal) {
+            rememberComment(state, commentId)
+            if (LOG_SKIPS && (!LOG_ONLY_MESSAGE_EVENTS || msgIsReal)) {
+              logJson("SKIP", { reason: "NOISE", pageId, commentId, postId, threadKey, msg: safeSlice(msgForLog, SKIP_MESSAGE_MAX_CHARS) })
+            }
+            continue
           }
 
-          // BAIT на первый живой коммент, но только если пост свежий
           if (BAIT_ENABLED && BAIT_ON_FIRST_COMMENT && postId) {
-            const meta = await getPostMeta(postId, pageToken);
-            const createdMs = Number(meta?.createdMs || 0);
-            const published = Number(meta?.published ?? 1);
+            const meta = await getPostMeta(state, postId, pageToken)
+            const createdMs = Number(meta?.createdMs || 0)
+            const published = Number(meta?.published ?? 1)
 
             if (published === 1 && createdMs) {
-              const ageMin = Math.floor((nowMs() - createdMs) / 60000);
+              const ageMin = Math.floor((nowMs() - createdMs) / 60000)
               if (ageMin <= BAIT_FRESH_POST_WINDOW_MIN) {
-                await ensureBaitForPost(postId, pageToken, ts, "first_comment_fallback");
-              } else {
-                logSkip("BAIT_OLD_POST_FIRST_COMMENT", { postId, ageMin, windowMin: BAIT_FRESH_POST_WINDOW_MIN });
+                await ensureBaitForPost(state, postId, pageToken, ts, "first_comment_fallback", pageId)
               }
-            } else {
-              logSkip("BAIT_META_MISSING_OR_UNPUBLISHED", { postId });
             }
           }
 
-          inflight.add(commentId);
+          state.inflight.add(commentId)
 
-          const likeDelay = LIKE_ENABLED ? randInt(LIKE_MIN_MS, LIKE_MAX_MS) : 0;
-
+          const likeDelay = LIKE_ENABLED ? randInt(LIKE_MIN_MS, LIKE_MAX_MS) : 0
           const replyDelay = LIKE_ENABLED
             ? randInt(REPLY_AFTER_LIKE_MIN_MS, REPLY_AFTER_LIKE_MAX_MS)
-            : randInt(FIRST_REPLY_MIN_MS, FIRST_REPLY_MAX_MS);
+            : randInt(FIRST_REPLY_MIN_MS, FIRST_REPLY_MAX_MS)
 
-          const dueLikeAt = Date.now() + likeDelay;
-          const dueReplyAt = Date.now() + likeDelay + replyDelay;
+          const dueLikeAt = nowMs() + likeDelay
+          const dueReplyAt = nowMs() + likeDelay + replyDelay
+
+          const fromForLog = String(comment?.from?.name || "")
+          const parentFromForLog = String(comment?.parent?.from?.name || "")
 
           if (LIKE_ENABLED) {
-            replyQueue.push({
+            state.replyQueue.push({
               type: "like",
               commentId,
               postId,
               threadKey,
               dueAt: dueLikeAt,
               run: async () => {
-                if (!isBotEnabled()) return false;
-                if (wasProcessed(commentId)) return false;
+                if (!isBotEnabled()) return false
+                if (wasProcessed(state, commentId)) return false
 
                 try {
-                  await likeComment(commentId, pageToken);
-                  logJson("LIKED", {
-                    commentId,
-                    postId,
-                    threadKey,
-                    from: LOG_WEBHOOK_MESSAGE ? fromForLog : undefined,
-                    msg: LOG_WEBHOOK_MESSAGE ? safeSlice(msgForLog, SKIP_MESSAGE_MAX_CHARS) : undefined
-                  });
-                  return true;
+                  await likeComment(commentId, pageToken)
+                  return true
                 } catch (err) {
-                  logJson("LIKE_FAILED", {
-                    commentId,
-                    postId,
-                    threadKey,
-                    err: String(err).slice(0, 240)
-                  });
-                  return false;
+                  logJson("LIKE_FAILED", { pageId, commentId, postId, threadKey, err: String(err).slice(0, 240) })
+                  return false
                 }
               }
-            });
+            })
           }
 
-          replyQueue.push({
+          state.replyQueue.push({
             type: "reply",
             commentId,
             postId,
@@ -1206,74 +1325,86 @@ app.post("/webhook", (req, res) => {
             dueAt: dueReplyAt,
             run: async () => {
               try {
-                if (!isBotEnabled()) {
-                  logSkip("BOT_DISABLED_DROP", { commentId, postId, threadKey });
-                  return false;
-                }
+                if (!isBotEnabled()) return false
+                if (wasProcessed(state, commentId)) return false
 
-                if (wasProcessed(commentId)) {
-                  logSkip("DUPLICATE_LATE", { commentId, postId, threadKey });
-                  return false;
-                }
+                const cached = getCachedComment(state, commentId)
+                const src = cached || comment
 
-                const cached = getCachedComment(commentId);
-                const src = cached || comment;
+                const signals = analyzeSignals(src)
 
-                const msgNow = safeSlice(src?.message || msgForLog, SKIP_MESSAGE_MAX_CHARS);
+                const postContext = await getPostContext(state, postId, pageToken)
+                if (hasCyrillic(postContext)) state.forceRussian = true
 
-                const signals = analyzeSignals(src);
+                const mode = detectReplyMode(state, src, postContext, signals)
+                if (mode.lang === "ru") state.forceRussian = true
 
                 const meta = {
                   isReply: Boolean(src?.parent?.id) || Boolean(isReply),
                   userName: String(src?.from?.name || fromForLog || ""),
                   parentName: String(src?.parent?.from?.name || parentFromForLog || ""),
                   location: signals.location,
-                  signals
-                };
+                  signals,
+                  lang: mode.lang,
+                  curiosityTime: pickCuriosityTimestamp(commentId),
+                  nameQuestion: Boolean((Boolean(src?.parent?.message) || Boolean(signals.debateLikely)) && getFirstName(src?.from?.name || fromForLog))
+                }
 
-                const postContext = await getPostContext(postId, pageToken);
+                const reply = await generateReply(src, postContext, meta)
+                const posted = await postReply(commentId, reply, pageToken)
 
-                const reply = await generateReply(src, postContext, meta);
-                const posted = await postReply(commentId, reply, pageToken);
+                rememberComment(state, commentId)
 
-                rememberComment(commentId);
+                const postedId = pickId(posted)
+                if (postedId) rememberComment(state, postedId)
 
-                const postedId = pickId(posted);
-                if (postedId) rememberComment(postedId);
-
-                markReply();
-                markThreadReply(threadKey);
+                markReply(state)
+                markThreadReply(state, threadKey)
 
                 logJson("REPLIED", {
+                  at: ts,
+                  pageId,
                   commentId,
                   postId,
                   threadKey,
                   likeDelayMs: LIKE_ENABLED ? likeDelay : 0,
                   replyAfterLikeMs: LIKE_ENABLED ? replyDelay : 0,
-                  msg: LOG_WEBHOOK_MESSAGE ? msgNow : undefined,
+                  msg: LOG_WEBHOOK_MESSAGE ? safeSlice(src?.message || "", SKIP_MESSAGE_MAX_CHARS) : undefined,
                   signals: LOG_WEBHOOK_MESSAGE ? meta.signals : undefined,
+                  lang: mode.lang,
                   reply,
                   postedId,
                   permalink: src?.permalink_url || ""
-                });
+                })
 
-                return true;
+                return true
               } finally {
-                inflight.delete(commentId);
+                state.inflight.delete(commentId)
               }
             }
-          });
+          })
 
-          scheduleQueueProcessing();
+          scheduleQueueProcessing(state, pageId)
         }
       }
     } catch (err) {
-      console.error("WEBHOOK ERROR", err);
+      logJson("WEBHOOK ERROR", { at: ts, err: String(err).slice(0, 500) })
     }
-  });
-});
+  })
+})
 
-app.get("/", (_, res) => res.send("Bot is running"));
+app.get("/", (_, res) => res.send("Bot is running"))
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server started on ${PORT}`));
+app.get("/webhook", (req, res) => {
+  const mode = req.query["hub.mode"]
+  const token = req.query["hub.verify_token"]
+  const challenge = req.query["hub.challenge"]
+
+  if (mode === "subscribe" && token === process.env.FB_VERIFY_TOKEN) {
+    return res.status(200).send(challenge)
+  }
+  return res.sendStatus(403)
+})
+
+const PORT = process.env.PORT || 3000
+app.listen(PORT, () => console.log(`Server started on ${PORT}`))
