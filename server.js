@@ -766,6 +766,67 @@ const isWrongLanguage = (text, lang) => {
   if (lang === "ru") return !hasCyrillic(s)
   return hasCyrillic(s)
 }
+const extractOpenAiText = (data) => {
+  if (typeof data?.output_text === "string" && data.output_text.trim()) {
+    return data.output_text.trim()
+  }
+
+  const outputs = Array.isArray(data?.output) ? data.output : []
+  for (const o of outputs) {
+    const items = Array.isArray(o?.content) ? o.content : []
+    for (const i of items) {
+      if (i?.type === "output_text" && typeof i?.text === "string") {
+        const t = i.text.trim()
+        if (t) return t
+      }
+    }
+  }
+  return ""
+}
+
+const trimReply = (text, maxChars = 240) => {
+  const t = String(text || "").trim()
+  if (t.length <= maxChars) return t
+
+  const clipped = t.slice(0, maxChars)
+  const lastSentenceEnd = Math.max(
+    clipped.lastIndexOf("."),
+    clipped.lastIndexOf("!"),
+    clipped.lastIndexOf("?")
+  )
+
+  if (lastSentenceEnd > 0) return clipped.slice(0, lastSentenceEnd + 1).trim()
+  return clipped.trim()
+}
+
+const enforceOneQuestionAtEnd = (text) => {
+  let s = String(text || "").trim()
+  if (!s) return s
+
+  const qCount = (s.match(/\?/g) || []).length
+  if (qCount > 1) {
+    const lastQ = s.lastIndexOf("?")
+    let before = s.slice(0, lastQ)
+    let after = s.slice(lastQ + 1)
+
+    before = before.replace(/\?/g, ".").replace(/\s+\./g, ".").trim()
+
+    if (/[A-Za-z0-9А-Яа-яЁё]/.test(after)) after = ""
+    after = after.replace(/\?/g, "").trim()
+
+    s = `${before}?${after ? " " + after : ""}`.trim()
+  }
+
+  const lastQ = s.lastIndexOf("?")
+  if (lastQ >= 0) {
+    const after = s.slice(lastQ + 1)
+    if (/[A-Za-z0-9А-Яа-яЁё]/.test(after)) {
+      s = s.slice(0, lastQ + 1).trim()
+    }
+  }
+
+  return s
+}
 
 const callOpenAi = async (input, temperature = 0.7, maxTokens = 180) => {
   const apiKey = process.env.OPENAI_API_KEY
