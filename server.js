@@ -110,7 +110,6 @@ const prune = (arr, windowMs) => {
 }
 
 const hasCyrillic = (s) => /[А-Яа-яЁё]/.test(String(s || ""))
-const hasLatin = (s) => /[A-Za-z]/.test(String(s || ""))
 
 const isNoiseOnly = (msg) => {
   const m = normalize(msg)
@@ -124,6 +123,12 @@ const isNoiseOnly = (msg) => {
 const stripHashtags = (text) => {
   const s = String(text || "")
   return normalize(s.replace(/#[\p{L}\p{N}_]+/gu, " "))
+}
+
+// Hard block Cyrillic in outputs. Keeps replies strictly English.
+const stripCyrillicChars = (text) => {
+  const s = String(text || "")
+  return normalize(s.replace(/[А-Яа-яЁё]+/g, " "))
 }
 
 const getFirstName = (fullName) => {
@@ -232,7 +237,6 @@ const createPageState = (pageId) => ({
   pageIdHint: String(pageId || "").trim(),
   pageIdResolved: String(pageId || "").trim(),
   pageName: "",
-  forceRussian: false,
 
   replyQueue: [],
   processingQueue: false,
@@ -527,15 +531,8 @@ const pickCuriosityTimestamp = (seed) => {
   return times[h % times.length]
 }
 
+// English only. Keeps UK vs US tone.
 const detectReplyMode = (state, comment, postContext, signals) => {
-  const msg = normalize(comment?.message)
-  const parent = normalize(comment?.parent?.message)
-  const ctx = normalize(postContext)
-  const joined = `${parent} ${msg} ${ctx}`.trim()
-
-  if (state.forceRussian) return { lang: "ru" }
-  if (hasCyrillic(joined)) return { lang: "ru" }
-
   const british = Boolean(signals?.britishLikely)
   return { lang: british ? "en-uk" : "en-us" }
 }
@@ -548,12 +545,17 @@ const buildPrompt = (comment, postContext, meta = {}) => {
   const userName = normalize(meta?.userName)
   const parentName = normalize(meta?.parentName)
 
-  const userFirst = getFirstName(userName)
-  const parentFirst = getFirstName(parentName)
+  let userFirst = getFirstName(userName)
+  let parentFirst = getFirstName(parentName)
+  if (hasCyrillic(userFirst)) userFirst = ""
+  if (hasCyrillic(parentFirst)) parentFirst = ""
 
   const signals = meta?.signals || {}
   const isReplyInThread = Boolean(meta?.isReply)
-  const location = normalize(meta?.location || signals.location || "")
+
+  const locRaw = normalize(meta?.location || signals.location || "")
+  const location = hasCyrillic(locRaw) ? "" : locRaw
+
   const lang = String(meta?.lang || "en-us")
 
   const sigLine = [
@@ -576,6 +578,8 @@ const buildPrompt = (comment, postContext, meta = {}) => {
     "Use 1 to 2 emojis total.",
     "No hashtags.",
     "Do not mention AI, bots, automation, or policies.",
+    "NEVER use Cyrillic characters.",
+    "If the comment is not in English, still reply in English.",
     "ALWAYS end with EXACTLY ONE question that invites a reply.",
     "The question must match the topic and the thread. No generic questions.",
     "If this is a reply thread, react to BOTH sides in a quick, playful way."
@@ -592,31 +596,8 @@ const buildPrompt = (comment, postContext, meta = {}) => {
     "If nothing special triggers: be relatable and a bit surprised."
   ]
 
-  const logicRulesRu = [
-    "Если bsLikely true: спокойно. 'Жаль, что не сработало', 'у меня сработало', 'пусть другие подтвердят'.",
-    "Если sarcasmLikely true: коротко, остроумно, потом по делу.",
-    "Если jinxingLikely true: 'постучи по дереву', 'не сглазить', 'боги техники'.",
-    "Если location есть: отметь локацию и погоду одной фразой.",
-    "Если praiseLikely true: добавь 'Сохрани'.",
-    `Если questionLikely true: добавь таймкод, например 'пересмотри около ${curiosityTime}'.`,
-    "Если ветка спорная: вмешайся коротко и игриво.",
-    "Если ничего не триггерит: по-дружески, будто сам удивился."
-  ]
-
   const header =
-    lang === "ru"
-      ? [
-          "Роль: Ты ведёшь страницу T.Lifehack. Ты живой, дружелюбный, чуть дерзкий автор в комментариях.",
-          "Цель: вовлечение, сохранения, дискуссии.",
-          "",
-          "Ответь ТОЛЬКО по-русски.",
-          ...baseRules,
-          ...logicRulesRu,
-          "",
-          `Сигналы: ${sigLine}`,
-          ""
-        ]
-      : lang === "en-uk"
+    lang === "en-uk"
       ? [
           "Role: You manage the T.Lifehack page. You are a savvy, friendly, witty creator in the comments.",
           "Goal: maximize engagement, push saves, grow community.",
@@ -660,7 +641,8 @@ const buildPrompt = (comment, postContext, meta = {}) => {
   lines.push("")
 
   if (isReplyInThread || signals.debateLikely) {
-    lines.push("End your final question addressing the new commenter by first name if available.")
+    if (userFirst) lines.push("End your final question addressing the new commenter by first name.")
+    else lines.push("End your final question addressing the new commenter.")
     lines.push("")
   }
 
@@ -670,27 +652,6 @@ const buildPrompt = (comment, postContext, meta = {}) => {
 const buildBaitPrompt = (postContext, lang) => {
   const ctx = normalize(postContext)
 
-  if (lang === "ru") {
-    return [
-      "Задача: Напиши ОДИН провокационный комментарий под новым видео T.Lifehack.",
-      "Цель: запустить спор, мнения, дискуссию.",
-      "Стратегия: полярный вопрос или вызов.",
-      "",
-      "Правила:",
-      "Пиши ТОЛЬКО по-русски.",
-      "1 или 2 коротких предложения.",
-      "1 или 2 эмодзи.",
-      "Без хештегов.",
-      "Не упоминай закреп, бота, AI, автоматизацию.",
-      "Максимально по теме контекста поста.",
-      "В конце ровно 1 вопрос.",
-      "",
-      "Контекст поста:",
-      ctx || "(нет контекста)",
-      ""
-    ].join("\n")
-  }
-
   if (lang === "en-uk") {
     return [
       "Task: Write ONE engagement bait comment for a new T.Lifehack video.",
@@ -699,6 +660,7 @@ const buildBaitPrompt = (postContext, lang) => {
       "",
       "Rules:",
       "Reply ONLY in British English.",
+      "NEVER use Cyrillic characters.",
       "1 to 2 short sentences.",
       "Use 1 to 2 emojis.",
       "No hashtags.",
@@ -719,6 +681,7 @@ const buildBaitPrompt = (postContext, lang) => {
     "",
     "Rules:",
     "Reply ONLY in American English.",
+    "NEVER use Cyrillic characters.",
     "1 to 2 short sentences.",
     "Use 1 to 2 emojis.",
     "No hashtags.",
@@ -760,12 +723,13 @@ const ensureNameInQuestion = (text, name, enabled) => {
   return out
 }
 
-const isWrongLanguage = (text, lang) => {
+// English only: wrong if empty or contains Cyrillic.
+const isWrongLanguage = (text) => {
   const s = String(text || "")
   if (!s.trim()) return true
-  if (lang === "ru") return !hasCyrillic(s)
   return hasCyrillic(s)
 }
+
 const extractOpenAiText = (data) => {
   if (typeof data?.output_text === "string" && data.output_text.trim()) {
     return data.output_text.trim()
@@ -789,11 +753,7 @@ const trimReply = (text, maxChars = 240) => {
   if (t.length <= maxChars) return t
 
   const clipped = t.slice(0, maxChars)
-  const lastSentenceEnd = Math.max(
-    clipped.lastIndexOf("."),
-    clipped.lastIndexOf("!"),
-    clipped.lastIndexOf("?")
-  )
+  const lastSentenceEnd = Math.max(clipped.lastIndexOf("."), clipped.lastIndexOf("!"), clipped.lastIndexOf("?"))
 
   if (lastSentenceEnd > 0) return clipped.slice(0, lastSentenceEnd + 1).trim()
   return clipped.trim()
@@ -859,47 +819,38 @@ const callOpenAi = async (input, temperature = 0.7, maxTokens = 180) => {
 
 const generateReply = async (comment, postContext, meta = {}) => {
   const lang = String(meta?.lang || "en-us")
-  const userFirst = getFirstName(meta?.userName || "")
-  const nameQuestion = Boolean(meta?.nameQuestion)
+  const rawFirst = getFirstName(meta?.userName || "")
+  const safeFirst = rawFirst && !hasCyrillic(rawFirst) ? rawFirst : ""
+  const nameQuestion = Boolean(meta?.nameQuestion && safeFirst)
 
   let first = await callOpenAi(buildPrompt(comment, postContext, meta), 0.9, 180)
   first = trimReply(stripHashtags(first), 240)
+  first = stripCyrillicChars(first)
   first = enforceOneQuestionAtEnd(first)
-  first = ensureNameInQuestion(first, userFirst, nameQuestion)
+  first = ensureNameInQuestion(first, safeFirst, nameQuestion)
 
   if (!first) throw new Error("Empty OpenAI reply")
+  if (!isWrongLanguage(first)) return first
 
-  if (!isWrongLanguage(first, lang === "ru" ? "ru" : "en")) return first
-
-  const retryPrompt =
-    lang === "ru"
-      ? [
-          "Перепиши ответ строго по-русски.",
-          "Сохрани живой тон.",
-          "1–3 коротких предложения.",
-          "1–2 эмодзи.",
-          "В конце ровно 1 вопрос.",
-          "Без хештегов.",
-          "",
-          `Текст: "${first}"`
-        ].join("\n")
-      : [
-          "Rewrite the reply strictly in English.",
-          "Keep the same witty, human tone and contractions.",
-          "Write 1 to 3 short sentences.",
-          "Use 1 to 2 emojis.",
-          "End with exactly one question.",
-          "No hashtags.",
-          "",
-          `Reply to rewrite: "${first}"`
-        ].join("\n")
+  const retryPrompt = [
+    "Rewrite the reply strictly in English.",
+    "NEVER use Cyrillic characters.",
+    "Keep the same witty, human tone and contractions.",
+    "Write 1 to 3 short sentences.",
+    "Use 1 to 2 emojis.",
+    "End with exactly one question.",
+    "No hashtags.",
+    "",
+    `Reply to rewrite: "${first}"`
+  ].join("\n")
 
   let second = await callOpenAi(retryPrompt, 0.4, 180)
   second = trimReply(stripHashtags(second), 240)
+  second = stripCyrillicChars(second)
   second = enforceOneQuestionAtEnd(second)
-  second = ensureNameInQuestion(second, userFirst, nameQuestion)
+  second = ensureNameInQuestion(second, safeFirst, nameQuestion)
 
-  if (second && !isWrongLanguage(second, lang === "ru" ? "ru" : "en")) return second
+  if (second && !isWrongLanguage(second)) return second
 
   return first
 }
@@ -907,38 +858,29 @@ const generateReply = async (comment, postContext, meta = {}) => {
 const generateBaitComment = async (postContext, lang) => {
   let first = await callOpenAi(buildBaitPrompt(postContext, lang), 0.95, 140)
   first = trimReply(stripHashtags(first), BAIT_MAX_CHARS)
+  first = stripCyrillicChars(first)
   first = enforceOneQuestionAtEnd(first)
 
   if (!first) throw new Error("Empty OpenAI bait")
+  if (!isWrongLanguage(first)) return first
 
-  if (!isWrongLanguage(first, lang === "ru" ? "ru" : "en")) return first
-
-  const retryPrompt =
-    lang === "ru"
-      ? [
-          "Перепиши строго по-русски.",
-          "1 или 2 коротких предложения.",
-          "1 или 2 эмодзи.",
-          "В конце ровно 1 вопрос.",
-          "Без хештегов.",
-          "",
-          `Текст: "${first}"`
-        ].join("\n")
-      : [
-          "Rewrite strictly in English.",
-          "1 to 2 short sentences.",
-          "Use 1 to 2 emojis.",
-          "End with exactly one question.",
-          "No hashtags.",
-          "",
-          `Text: "${first}"`
-        ].join("\n")
+  const retryPrompt = [
+    "Rewrite strictly in English.",
+    "NEVER use Cyrillic characters.",
+    "1 to 2 short sentences.",
+    "Use 1 to 2 emojis.",
+    "End with exactly one question.",
+    "No hashtags.",
+    "",
+    `Text: "${first}"`
+  ].join("\n")
 
   let second = await callOpenAi(retryPrompt, 0.35, 140)
   second = trimReply(stripHashtags(second), BAIT_MAX_CHARS)
+  second = stripCyrillicChars(second)
   second = enforceOneQuestionAtEnd(second)
 
-  if (second && !isWrongLanguage(second, lang === "ru" ? "ru" : "en")) return second
+  if (second && !isWrongLanguage(second)) return second
 
   return first
 }
@@ -1122,9 +1064,8 @@ const ensureBaitForPost = async (state, postId, pageToken, ts, reason, pageId) =
         if (wasBaitPosted(state, pid)) return false
 
         const postContext = await getPostContext(state, pid, pageToken)
-        if (hasCyrillic(postContext)) state.forceRussian = true
 
-        const lang = state.forceRussian ? "ru" : "en-us"
+        const lang = "en-us"
         const bait = await generateBaitComment(postContext, lang)
 
         const posted = await postCommentOnPost(pid, bait, pageToken)
@@ -1393,12 +1334,12 @@ app.post("/webhook", (req, res) => {
                 const src = cached || comment
 
                 const signals = analyzeSignals(src)
-
                 const postContext = await getPostContext(state, postId, pageToken)
-                if (hasCyrillic(postContext)) state.forceRussian = true
 
                 const mode = detectReplyMode(state, src, postContext, signals)
-                if (mode.lang === "ru") state.forceRussian = true
+
+                const fn = getFirstName(src?.from?.name || fromForLog)
+                const safeName = fn && !hasCyrillic(fn)
 
                 const meta = {
                   isReply: Boolean(src?.parent?.id) || Boolean(isReply),
@@ -1408,7 +1349,7 @@ app.post("/webhook", (req, res) => {
                   signals,
                   lang: mode.lang,
                   curiosityTime: pickCuriosityTimestamp(commentId),
-                  nameQuestion: Boolean((Boolean(src?.parent?.message) || Boolean(signals.debateLikely)) && getFirstName(src?.from?.name || fromForLog))
+                  nameQuestion: Boolean((Boolean(src?.parent?.message) || Boolean(signals.debateLikely)) && safeName)
                 }
 
                 const reply = await generateReply(src, postContext, meta)
